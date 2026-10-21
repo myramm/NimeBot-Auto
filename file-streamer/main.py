@@ -787,11 +787,16 @@ async def stream_telegram_file(request: web.Request, tg_client: TelegramClient, 
         response = web.StreamResponse(status=206, reason="Partial Content", headers=headers)
         await response.prepare(request)
 
+        if request.method == "HEAD":
+            return response
+
         try:
             async for chunk in tg_client.iter_download(doc, offset=start, limit=content_length, chunk_size=256 * 1024):
                 await response.write(chunk)
-        except (ConnectionResetError, asyncio.CancelledError):
+        except (ConnectionResetError, ConnectionError, asyncio.CancelledError):
             pass
+        except Exception as e:
+            logging.debug(f"Stream interrupted: {e}")
         return response
     else:
         # Standard Full File Stream / Download
@@ -804,11 +809,16 @@ async def stream_telegram_file(request: web.Request, tg_client: TelegramClient, 
         response = web.StreamResponse(status=200, headers=headers)
         await response.prepare(request)
 
+        if request.method == "HEAD":
+            return response
+
         try:
             async for chunk in tg_client.iter_download(doc, chunk_size=256 * 1024):
                 await response.write(chunk)
-        except (ConnectionResetError, asyncio.CancelledError):
+        except (ConnectionResetError, ConnectionError, asyncio.CancelledError):
             pass
+        except Exception as e:
+            logging.debug(f"Stream interrupted: {e}")
         return response
 
 # ----------------- MAIN TELEGRAM APP & WEB RUNNER -----------------
