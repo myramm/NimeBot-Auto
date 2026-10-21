@@ -7,23 +7,24 @@ DEFAULT_CONFIG_PATH = "config.json"
 class Config:
     def __init__(self, path: str = DEFAULT_CONFIG_PATH):
         self.path = path
-        self.bot_token = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-        self.api_id = os.environ.get("API_ID", "37124183")
-        self.api_hash = os.environ.get("API_HASH", "f4d846728e694c2d1071ca7d3b2f6c81")
-        self.log_channel = os.environ.get("LOG_CHANNEL", "-1004462080662")
+        self.bot_token = os.environ.get("BOT_TOKEN", "")
+        self.api_id = os.environ.get("API_ID", "")
+        self.api_hash = os.environ.get("API_HASH", "")
+        self.log_channel = os.environ.get("LOG_CHANNEL", "")
         self.streamer_url = os.environ.get("STREAMER_URL", "https://streamer-production-c24a.up.railway.app")
         
         self.railway_token = os.environ.get("RAILWAY_TOKEN", "")
         self.railway_email = ""
-        self.railway_project_id = os.environ.get("RAILWAY_PROJECT_ID", "9cb30572-6794-4cf6-9df2-778e6933d48d")
-        self.railway_env_id = os.environ.get("RAILWAY_ENV_ID", "035a4bdc-a53c-431a-b077-992b0224ea67")
-        self.railway_service_id = os.environ.get("RAILWAY_SERVICE_ID", "4b50b07a-8ee6-4ce7-b7fa-90e29428c6d8")
+        self.railway_project_id = os.environ.get("RAILWAY_PROJECT_ID", "")
+        self.railway_env_id = os.environ.get("RAILWAY_ENV_ID", "")
+        self.railway_service_id = os.environ.get("RAILWAY_SERVICE_ID", "")
         
         self.mode = "auto"  # 'auto' or 'manual'
         self.is_running = False
         self.active_deployment_id = ""
         self.active_progress_msg_id = 0
         self.admin_chat_id = 0
+        self.admin_user_id = int(os.environ.get("ADMIN_USER_ID", "0"))
         
         self.load()
 
@@ -47,6 +48,7 @@ class Config:
                     self.active_deployment_id = data.get("active_deployment_id", self.active_deployment_id)
                     self.active_progress_msg_id = data.get("active_progress_msg_id", self.active_progress_msg_id)
                     self.admin_chat_id = data.get("admin_chat_id", self.admin_chat_id)
+                    self.admin_user_id = data.get("admin_user_id", self.admin_user_id)
             except Exception as e:
                 print(f"Error loading config {self.path}: {e}")
 
@@ -66,7 +68,8 @@ class Config:
             "is_running": self.is_running,
             "active_deployment_id": self.active_deployment_id,
             "active_progress_msg_id": self.active_progress_msg_id,
-            "admin_chat_id": self.admin_chat_id
+            "admin_chat_id": self.admin_chat_id,
+            "admin_user_id": self.admin_user_id
         }
         parent = os.path.dirname(self.path)
         if parent:

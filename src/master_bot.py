@@ -3,10 +3,16 @@ import json
 import urllib.request
 import urllib.error
 import asyncio
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any, Optional, List
 
 from src.config import Config
-from src.database import init_db, get_uploaded_episodes
+from src.database import init_db, get_uploaded_episodes, has_uploaded, record_upload
+from src.animein_client import (
+    get_latest_catalog,
+    get_movie_details,
+    get_movie_episodes,
+    get_episode_streams
+)
 from src.railway_client import (
     verify_railway_token,
     ensure_railway_project,
@@ -127,10 +133,62 @@ class TelegramBotAPI:
             return None
 
 class MasterBot:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, db_path: str = "anime_db.sqlite"):
         self.config = config
+        self.db_path = db_path
         self.api = TelegramBotAPI(config.bot_token)
-        init_db()
+        init_db(self.db_path)
+
+    def is_admin(self, user_id: int) -> bool:
+        if self.config.admin_user_id == 0:
+            # First user to interact becomes registered admin
+            self.config.admin_user_id = user_id
+            self.config.save()
+            return True
+        return user_id == self.config.admin_user_id
+
+    def get_pending_downloads(self, movie_id: str = "") -> List[Dict[str, Any]]:
+        """
+        Queries Animein API and filters out episodes already recorded in SQLite
+        to strictly enforce zero duplicate uploads.
+        """
+        targets = []
+        if movie_id:
+            det = get_movie_details(movie_id)
+            title = det.get("title", f"Anime {movie_id}") if det else f"Anime {movie_id}"
+            targets.append({"id": str(movie_id), "title": title})
+        else:
+            cat = get_latest_catalog()
+            targets.extend(cat)
+
+        pending = []
+        for t in targets:
+            m_id = str(t.get("id", ""))
+            m_title = t.get("title", "Unknown")
+            if not m_id:
+                continue
+
+            episodes = get_movie_episodes(m_id)
+            for ep in episodes:
+                ep_id = ep.get("id")
+                ep_idx = int(ep.get("index", 0))
+                streams = get_episode_streams(ep_id)
+
+                for s in streams:
+                    q = s.get("quality", "720p")
+                    url = s.get("url")
+                    if not url:
+                        continue
+
+                    if not has_uploaded(m_id, ep_idx, q, db_path=self.db_path):
+                        pending.append({
+                            "movie_id": m_id,
+                            "title": m_title,
+                            "ep_index": ep_idx,
+                            "quality": q,
+                            "stream_url": url
+                        })
+        return pending
 
     def handle_start(self, chat_id: int | str) -> None:
         text = format_menu_text(self.config.mode, self.config.is_running, self.config.railway_email)
@@ -175,7 +233,13 @@ class MasterBot:
             self.api.send_message(chat_id, "❌ Token Railway belum diatur! Pasang dulu dengan `/token <token>`.")
             return
 
-        prog_msg = self.api.send_message(chat_id, "🚀 Menyiapkan Railway Worker...\n`[░░░░░░░░░░] 0.0% Initializing`")
+        self.api.send_message(chat_id, "🔍 Memeriksa anime baru dari katalog...")
+        pending = self.get_pending_downloads()
+        if not pending:
+            self.api.send_message(chat_id, "✅ Semua episode terbaru sudah terupload! Tidak ada duplikat yang perlu diproses.")
+            return
+
+        prog_msg = self.api.send_message(chat_id, f"🚀 Menyiapkan {len(pending)} episode baru di Railway Worker...\n`[░░░░░░░░░░] 0.0% Initializing`")
         prog_msg_id = prog_msg.get("message_id", 0) if prog_msg else 0
 
         cmd = generate_worker_payload(
@@ -186,7 +250,8 @@ class MasterBot:
             streamer_url=self.config.streamer_url,
             log_channel=self.config.log_channel,
             api_id=self.config.api_id,
-            api_hash=self.config.api_hash
+            api_hash=self.config.api_hash,
+            items=pending
         )
 
         ok = set_worker_start_command(
@@ -205,7 +270,7 @@ class MasterBot:
             self.config.railway_service_id
         )
         self.config.set_status(is_running=True, progress_msg_id=prog_msg_id)
-        self.api.send_message(chat_id, "✅ Auto update anime berhasil dijalankan di Railway!")
+        self.api.send_message(chat_id, f"✅ Auto update anime berhasil dijalankan di Railway ({len(pending)} episode dalam antrean)!")
 
     def handle_download(self, chat_id: int | str, movie_id: str) -> None:
         if not self.config.railway_token:
@@ -215,7 +280,12 @@ class MasterBot:
             self.api.send_message(chat_id, "❌ Masukkan Anime ID. Contoh: `/download 6635`")
             return
 
-        prog_msg = self.api.send_message(chat_id, f"🚀 Menyiapkan download Anime ID: `{movie_id}`...\n`[░░░░░░░░░░] 0.0% Initializing`")
+        pending = self.get_pending_downloads(movie_id=movie_id)
+        if not pending:
+            self.api.send_message(chat_id, f"✅ Semua episode untuk Anime `{movie_id}` sudah terupload! Filter anti-duplicate aktif.")
+            return
+
+        prog_msg = self.api.send_message(chat_id, f"🚀 Menyiapkan download Anime `{movie_id}` ({len(pending)} episode pending)...\n`[░░░░░░░░░░] 0.0% Initializing`")
         prog_msg_id = prog_msg.get("message_id", 0) if prog_msg else 0
 
         cmd = generate_worker_payload(
@@ -227,7 +297,8 @@ class MasterBot:
             streamer_url=self.config.streamer_url,
             log_channel=self.config.log_channel,
             api_id=self.config.api_id,
-            api_hash=self.config.api_hash
+            api_hash=self.config.api_hash,
+            items=pending
         )
 
         set_worker_start_command(
@@ -242,7 +313,7 @@ class MasterBot:
             self.config.railway_service_id
         )
         self.config.set_status(is_running=True, progress_msg_id=prog_msg_id)
-        self.api.send_message(chat_id, f"✅ Manual download untuk Anime `{movie_id}` dimulai di Railway!")
+        self.api.send_message(chat_id, f"✅ Manual download untuk Anime `{movie_id}` dimulai di Railway ({len(pending)} episode)!")
 
     def handle_stop(self, chat_id: int | str) -> None:
         if not self.config.railway_token:
@@ -250,17 +321,17 @@ class MasterBot:
             return
 
         self.api.send_message(chat_id, "🛑 Menghentikan Railway Worker...")
-        # Set idle command and redeploy to stop downloading
+        # 1. Terminate active deployment immediately
+        dep = get_latest_deployment(self.config.railway_token, self.config.railway_service_id, self.config.railway_env_id)
+        if dep and dep.get("id"):
+            stop_worker(self.config.railway_token, dep["id"])
+
+        # 2. Set idle command
         set_worker_start_command(
             self.config.railway_token,
             self.config.railway_env_id,
             self.config.railway_service_id,
             'python3 -c "import time; print(\'Worker idle\'); time.sleep(86400)"'
-        )
-        redeploy_worker(
-            self.config.railway_token,
-            self.config.railway_env_id,
-            self.config.railway_service_id
         )
         self.config.set_status(is_running=False)
         self.api.send_message(chat_id, "🛑 Railway Worker berhasil dihentikan!")
@@ -271,8 +342,13 @@ class MasterBot:
 
     def dispatch_message(self, msg: dict) -> None:
         chat_id = msg.get("chat", {}).get("id")
+        user_id = (msg.get("from") or {}).get("id") or chat_id
         text = msg.get("text", "")
         if not chat_id or not text:
+            return
+
+        if not self.is_admin(user_id):
+            self.api.send_message(chat_id, "⛔ Unauthorized. Akses ditolak.")
             return
 
         cmd, arg = parse_command(text)
@@ -293,11 +369,16 @@ class MasterBot:
 
     def dispatch_callback(self, cq: dict) -> None:
         cq_id = cq.get("id")
+        user_id = (cq.get("from") or {}).get("id")
         data = cq.get("data", "")
         msg = cq.get("message", {})
         chat_id = msg.get("chat", {}).get("id")
         msg_id = msg.get("message_id")
         if not chat_id:
+            return
+
+        if not self.is_admin(user_id or chat_id):
+            self.api.answer_callback(cq_id, "⛔ Akses ditolak")
             return
 
         self.api.answer_callback(cq_id, "Memproses...")
@@ -307,7 +388,6 @@ class MasterBot:
             self.handle_stop(chat_id)
         elif data == "btn_toggle_mode":
             self.handle_mode(chat_id)
-            # Update menu message
             text = format_menu_text(self.config.mode, self.config.is_running, self.config.railway_email)
             kb = build_menu_keyboard(self.config.mode, self.config.is_running)
             self.api.edit_message(chat_id, msg_id, text, reply_markup=kb)
@@ -322,13 +402,16 @@ class MasterBot:
         offset = 0
         print("MasterBot polling loop started...")
         while True:
-            updates = self.api.get_updates(offset=offset, timeout=10)
-            for u in updates:
-                offset = max(offset, u["update_id"] + 1)
-                if "message" in u:
-                    self.dispatch_message(u["message"])
-                elif "callback_query" in u:
-                    self.dispatch_callback(u["callback_query"])
+            try:
+                updates = self.api.get_updates(offset=offset, timeout=10)
+                for u in updates:
+                    offset = max(offset, u["update_id"] + 1)
+                    if "message" in u:
+                        self.dispatch_message(u["message"])
+                    elif "callback_query" in u:
+                        self.dispatch_callback(u["callback_query"])
+            except Exception as e:
+                print(f"Polling loop error: {e}")
             time.sleep(0.5)
 
 if __name__ == "__main__":

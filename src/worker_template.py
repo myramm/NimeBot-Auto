@@ -1,5 +1,6 @@
 import base64
 import json
+from typing import Optional, List, Dict, Any
 
 def generate_worker_payload(
     bot_token: str,
@@ -8,13 +9,15 @@ def generate_worker_payload(
     target_mode: str = "auto",
     movie_id: str = "",
     streamer_url: str = "https://streamer-production-c24a.up.railway.app",
-    log_channel: str = "-1004462080662",
-    api_id: str = "37124183",
-    api_hash: str = "f4d846728e694c2d1071ca7d3b2f6c81"
+    log_channel: str = "",
+    api_id: str = "",
+    api_hash: str = "",
+    items: Optional[List[Dict[str, Any]]] = None
 ) -> str:
     """
     Generates a standalone base64-encoded Python command string
-    that runs on Railway to execute the worker with real-time progress updates.
+    that runs on Railway to execute the worker with real-time progress updates,
+    download retries, and streamer buttons.
     """
     config = {
         "bot_token": bot_token,
@@ -23,15 +26,16 @@ def generate_worker_payload(
         "target_mode": target_mode,
         "movie_id": str(movie_id),
         "streamer_url": streamer_url,
-        "log_channel": log_channel,
-        "api_id": api_id,
-        "api_hash": api_hash
+        "log_channel": str(log_channel),
+        "api_id": str(api_id),
+        "api_hash": str(api_hash),
+        "items": items or []
     }
     config_json = json.dumps(config)
 
     worker_code = f"""
 import os, sys, time, json, math, urllib.request, urllib.error, asyncio
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 from telethon.tl.types import DocumentAttributeVideo
 
 CFG = {config_json}
@@ -91,72 +95,107 @@ async def main():
     await client.start(bot_token=CFG['bot_token'])
     channel = int(CFG['log_channel'])
 
-    movies_to_process = []
-    if CFG['target_mode'] == 'manual' and CFG['movie_id']:
-        det = api_get(f"3/2/movie/detail/{{CFG['movie_id']}}?id_user=0&key_client=guest&apk_ver=5.2.2")
-        title = det.get('data', {{}}).get('movie', {{}}).get('title', f"Anime {{CFG['movie_id']}}")
-        movies_to_process.append({{"id": CFG['movie_id'], "title": title}})
+    queue = []
+    if CFG.get('items'):
+        queue = CFG['items']
     else:
-        cat = api_get("3/2/home/new?id_user=0&key_client=guest&apk_ver=5.2.2")
-        movies = cat.get('data', {{}}).get('movie', [])
-        movies_to_process.extend(movies)
+        movies_to_process = []
+        if CFG['target_mode'] == 'manual' and CFG['movie_id']:
+            det = api_get(f"3/2/movie/detail/{{CFG['movie_id']}}?id_user=0&key_client=guest&apk_ver=5.2.2")
+            title = det.get('data', {{}}).get('movie', {{}}).get('title', f"Anime {{CFG['movie_id']}}")
+            movies_to_process.append({{"id": CFG['movie_id'], "title": title}})
+        else:
+            cat = api_get("3/2/home/new?id_user=0&key_client=guest&apk_ver=5.2.2")
+            movies = cat.get('data', {{}}).get('movie', [])
+            movies_to_process.extend(movies)
 
-    for m in movies_to_process:
-        m_id = str(m.get('id', ''))
-        m_title = m.get('title', 'Unknown')
-        eps_data = api_get(f"3/2/movie/episode/{{m_id}}?id_user=0&key_client=guest&apk_ver=5.2.2")
-        episodes = eps_data.get('data', {{}}).get('episode', [])
-        
-        for ep in episodes:
-            ep_id = ep.get('id')
-            ep_idx = int(ep.get('index', 0))
-            streams_data = api_get(f"3/2/episode/streamnew/{{ep_id}}?id_user=0&key_client=guest&apk_ver=5.2.2")
-            streams = streams_data.get('data', {{}}).get('stream', [])
+        for m in movies_to_process:
+            m_id = str(m.get('id', ''))
+            m_title = m.get('title', 'Unknown')
+            eps_data = api_get(f"3/2/movie/episode/{{m_id}}?id_user=0&key_client=guest&apk_ver=5.2.2")
+            episodes = eps_data.get('data', {{}}).get('episode', [])
+            for ep in episodes:
+                ep_id = ep.get('id')
+                ep_idx = int(ep.get('index', 0))
+                streams_data = api_get(f"3/2/episode/streamnew/{{ep_id}}?id_user=0&key_client=guest&apk_ver=5.2.2")
+                for s in streams_data.get('data', {{}}).get('stream', []):
+                    queue.append({{
+                        "movie_id": m_id,
+                        "title": m_title,
+                        "ep_index": ep_idx,
+                        "quality": s.get('quality', '720p'),
+                        "stream_url": s.get('url')
+                    }})
 
-            for s in streams:
-                q = s.get('quality', '720p')
-                s_url = s.get('url')
-                if not s_url: continue
+    for item in queue:
+        m_id = item['movie_id']
+        m_title = item['title']
+        ep_idx = item['ep_index']
+        q = item['quality']
+        s_url = item['stream_url']
+        if not s_url: continue
 
-                filename = f"/tmp/{{m_id}}_{{ep_idx}}_{{q}}.mp4"
-                try:
-                    # Download phase
-                    req = urllib.request.Request(s_url, headers={{"User-Agent": "okhttp/4.12.0", "Referer": "https://xyz-api.animein.net"}})
-                    with urllib.request.urlopen(req, timeout=30) as resp, open(filename, 'wb') as f:
-                        total_size = int(resp.headers.get('content-length', 0))
-                        dl_size = 0
-                        t0 = time.time()
-                        while True:
-                            chunk = resp.read(1024 * 512)
-                            if not chunk: break
-                            f.write(chunk)
-                            dl_size += len(chunk)
-                            elapsed = max(0.001, time.time() - t0)
-                            notify_progress(m_title, ep_idx, q, "Downloading", dl_size, total_size, dl_size/elapsed)
+        filename = f"/tmp/{{m_id}}_{{ep_idx}}_{{q}}.mp4"
+        max_attempts = 3
+        downloaded = False
 
-                    # Upload phase
-                    total_file_size = os.path.getsize(filename)
+        for attempt in range(1, max_attempts + 1):
+            try:
+                notify_progress(m_title, ep_idx, q, f"Downloading (attempt {{attempt}})", 0, 100, 0)
+                req = urllib.request.Request(s_url, headers={{"User-Agent": "okhttp/4.12.0", "Referer": "https://xyz-api.animein.net"}})
+                with urllib.request.urlopen(req, timeout=30) as resp, open(filename, 'wb') as f:
+                    total_size = int(resp.headers.get('content-length', 0))
+                    dl_size = 0
                     t0 = time.time()
-                    def upload_cb(sent, total):
-                        el = max(0.001, time.time() - t0)
-                        notify_progress(m_title, ep_idx, q, "Uploading to Telegram", sent, total, sent/el)
+                    while True:
+                        chunk = resp.read(1024 * 512)
+                        if not chunk: break
+                        f.write(chunk)
+                        dl_size += len(chunk)
+                        elapsed = max(0.001, time.time() - t0)
+                        notify_progress(m_title, ep_idx, q, "Downloading", dl_size, total_size, dl_size/elapsed)
+                downloaded = True
+                break
+            except Exception as e:
+                time.sleep(2)
+                if attempt == max_attempts:
+                    notify_progress(m_title, ep_idx, q, f"Download Failed: {{str(e)}}", 0, 0, 0)
 
-                    caption = f"🎬 **{{m_title}} - Ep {{ep_idx}} ({{q}})**\\n\\n🍿 Powered by ReNime AutoBot"
-                    sent_msg = await client.send_file(
-                        channel,
-                        filename,
-                        caption=caption,
-                        progress_callback=upload_cb,
-                        attributes=[DocumentAttributeVideo(duration=0, w=1280, h=720, supports_streaming=True)]
-                    )
+        if not downloaded:
+            if os.path.exists(filename): os.remove(filename)
+            continue
 
-                    # Post completed notification
-                    notify_progress(m_title, ep_idx, q, "Completed ✅", total_file_size, total_file_size, 0)
-                except Exception as e:
-                    notify_progress(m_title, ep_idx, q, f"Error: {{str(e)}}", 0, 0, 0)
-                finally:
-                    if os.path.exists(filename):
-                        os.remove(filename)
+        try:
+            total_file_size = os.path.getsize(filename)
+            t0 = time.time()
+            def upload_cb(sent, total):
+                el = max(0.001, time.time() - t0)
+                notify_progress(m_title, ep_idx, q, "Uploading to Telegram", sent, total, sent/el)
+
+            caption = f"🎬 **{{m_title}} - Ep {{ep_idx}} ({{q}})**\\n\\n🍿 Powered by ReNime AutoBot"
+            sent_msg = await client.send_file(
+                channel,
+                filename,
+                caption=caption,
+                progress_callback=upload_cb,
+                attributes=[DocumentAttributeVideo(duration=0, w=1280, h=720, supports_streaming=True)]
+            )
+
+            # Attach Streamer URL buttons
+            stream_url = f"{{CFG['streamer_url']}}/watch/{{sent_msg.id}}"
+            download_url = f"{{CFG['streamer_url']}}/download/{{sent_msg.id}}"
+            buttons = [
+                [Button.url("🌐 Stream", stream_url), Button.url("📥 Download", download_url)]
+            ]
+            await client.edit_message(channel, sent_msg.id, text=caption, buttons=buttons)
+
+            # Post completed status to user
+            notify_progress(m_title, ep_idx, q, "Completed ✅", total_file_size, total_file_size, 0)
+        except Exception as e:
+            notify_progress(m_title, ep_idx, q, f"Upload Error: {{str(e)}}", 0, 0, 0)
+        finally:
+            if os.path.exists(filename):
+                os.remove(filename)
 
 if __name__ == '__main__':
     asyncio.run(main())
