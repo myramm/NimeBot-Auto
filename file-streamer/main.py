@@ -91,21 +91,62 @@ def init_db():
     conn.commit()
     conn.close()
 
-def has_uploaded(movie_id: str, ep_index: int, quality: str, title: str = "") -> bool:
+def has_anime_info_card(title: str) -> bool:
+    """Check if Anime Info Card with poster has already been posted to the channel."""
+    clean_t = re.sub(r"^[┌│├└─\s🎬]+", "", title).strip() if title else ""
+    if not clean_t:
+        return False
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    if title:
-        cursor.execute("SELECT 1 FROM records WHERE (movie_id = ? OR anime_title = ?) AND ep_index = ? AND quality = ?", (str(movie_id), str(title), int(ep_index), str(quality)))
-    else:
-        cursor.execute("SELECT 1 FROM records WHERE movie_id = ? AND ep_index = ? AND quality = ?", (str(movie_id), int(ep_index), str(quality)))
+    cursor.execute("""
+        SELECT 1 FROM anime_series 
+        WHERE (LOWER(title) = LOWER(?) OR title LIKE ? OR LOWER(?) LIKE '%' || LOWER(title) || '%')
+          AND cover_msg_id IS NOT NULL
+    """, (clean_t, f"%{clean_t}%", clean_t))
     row = cursor.fetchone()
     conn.close()
     return row is not None
 
+def has_uploaded(movie_id: str, ep_index: int, quality: str, title: str = "") -> bool:
+    """Strict anti-duplicate checker across channel history and local database."""
+    clean_t = re.sub(r"^[┌│├└─\s🎬]+", "", title).strip() if title else ""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # 1. Match by Title (highest reliability for channel history where movie_id may be empty)
+    if clean_t:
+        cursor.execute("""
+            SELECT 1 FROM records 
+            WHERE (LOWER(anime_title) = LOWER(?) OR anime_title LIKE ? OR LOWER(?) LIKE '%' || LOWER(anime_title) || '%') 
+              AND ep_index = ? 
+              AND LOWER(quality) = LOWER(?)
+        """, (clean_t, f"%{clean_t}%", clean_t, int(ep_index), str(quality).lower()))
+        row = cursor.fetchone()
+        if row:
+            conn.close()
+            return True
+
+    # 2. Match by movie_id if provided
+    if movie_id and str(movie_id) != "":
+        cursor.execute("""
+            SELECT 1 FROM records 
+            WHERE movie_id = ? 
+              AND ep_index = ? 
+              AND LOWER(quality) = LOWER(?)
+        """, (str(movie_id), int(ep_index), str(quality).lower()))
+        row = cursor.fetchone()
+        if row:
+            conn.close()
+            return True
+
+    conn.close()
+    return False
+
 def record_upload(movie_id: str, ep_index: int, quality: str, msg_id: int, title: str, file_size: int = 0):
     conn = sqlite3.connect(DB_PATH)
+    clean_t = re.sub(r"^[┌│├└─\s🎬]+", "", title).strip()
     conn.execute("INSERT OR REPLACE INTO records (movie_id, ep_index, quality, msg_id, anime_title, file_size) VALUES (?, ?, ?, ?, ?, ?)",
-                 (str(movie_id), int(ep_index), str(quality), int(msg_id), str(title), int(file_size)))
+                 (str(movie_id), int(ep_index), str(quality).lower(), int(msg_id), clean_t, int(file_size)))
     conn.commit()
     conn.close()
 
@@ -620,7 +661,12 @@ def build_episodes_menu(movie_id: str) -> Tuple[str, List[List[Button]]]:
     for ep in episodes:
         ep_id = str(ep.get("id"))
         idx = int(ep.get("index", 0))
-        done = has_uploaded(movie_id, idx, "720p") or has_uploaded(movie_id, idx, "1080p")
+        done = (
+            has_uploaded(movie_id, idx, "720p", title=title) or 
+            has_uploaded(movie_id, idx, "1080p", title=title) or 
+            has_uploaded(movie_id, idx, "360p", title=title) or 
+            has_uploaded(movie_id, idx, "480p", title=title)
+        )
         icon = "✅" if done else "📥"
         curr.append(Button.inline(f"{icon} Ep {idx}", f"dlep_{movie_id}_{ep_id}_{idx}".encode()))
         if len(curr) == 3:
@@ -650,12 +696,12 @@ async def run_transfer_pipeline(client: TelegramClient, chat_id: int, prog_msg_i
             q = item["quality"]
             s_url = item["stream_url"]
 
-            if has_uploaded(m_id, ep_idx, q):
+            if has_uploaded(m_id, ep_idx, q, title=title):
                 logging.info(f"Skipping already uploaded: {title} Ep {ep_idx} ({q})")
                 continue
 
-            # Post Anime Info Card with Poster before first episode in this batch
-            if m_id not in posted_anime_headers:
+            # Post Anime Info Card with Poster ONLY IF NOT ALREADY POSTED in channel
+            if m_id not in posted_anime_headers and not has_anime_info_card(title):
                 try:
                     det = get_movie_details(m_id)
                     if det:
@@ -692,16 +738,30 @@ async def run_transfer_pipeline(client: TelegramClient, chat_id: int, prog_msg_i
                             except Exception as err:
                                 logging.warning(f"Could not download poster: {err}")
 
+                        sent_card = None
                         if poster_path and os.path.exists(poster_path):
-                            await client.send_file(LOG_CHANNEL, poster_path, caption=info_caption)
+                            sent_card = await client.send_file(LOG_CHANNEL, poster_path, caption=info_caption)
                             try: os.remove(poster_path)
                             except Exception: pass
                         else:
-                            await client.send_message(LOG_CHANNEL, info_caption)
+                            sent_card = await client.send_message(LOG_CHANNEL, info_caption)
+
+                        # Record in anime_series so it will NEVER be sent again
+                        if sent_card:
+                            conn = sqlite3.connect(DB_PATH)
+                            slug = re.sub(r"[^a-zA-Z0-9]+", "-", a_title.lower()).strip("-")
+                            conn.execute("""
+                                INSERT OR REPLACE INTO anime_series (title, slug, cover_msg_id, anime_type, studio, year, genres, status, synopsis)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (a_title, slug, sent_card.id, a_type, "-", year, genre, status, synopsis))
+                            conn.commit()
+                            conn.close()
 
                         posted_anime_headers.add(m_id)
                 except Exception as e:
                     logging.error(f"Error posting anime info card: {e}")
+            else:
+                posted_anime_headers.add(m_id)
 
             filename = f"/tmp/{m_id}_{ep_idx}_{q}.mp4"
             logging.info(f"[{idx}/{len(items)}] Downloading: {title} Ep {ep_idx} ({q}) from {s_url}")
@@ -1902,10 +1962,10 @@ async def main():
                     ep_idx = int(ep.get("index", 0))
                     # Pre-check if standard qualities are already uploaded
                     if q_filter == "ALL":
-                        if has_uploaded(m_id, ep_idx, "720p") and has_uploaded(m_id, ep_idx, "1080p"):
+                        if (has_uploaded(m_id, ep_idx, "720p", title=title) or has_uploaded(m_id, ep_idx, "360p", title=title)) and has_uploaded(m_id, ep_idx, "1080p", title=title):
                             continue
                     else:
-                        if has_uploaded(m_id, ep_idx, q_filter):
+                        if has_uploaded(m_id, ep_idx, q_filter, title=title):
                             continue
 
                     streams = await asyncio.to_thread(get_episode_streams, ep_id)
@@ -1914,7 +1974,7 @@ async def main():
                         url = s.get("url")
                         if q_filter != "ALL" and q != q_filter:
                             continue
-                        if url and not has_uploaded(m_id, ep_idx, q):
+                        if url and not has_uploaded(m_id, ep_idx, q, title=title):
                             pending.append({
                                 "movie_id": m_id,
                                 "title": title,
@@ -1971,7 +2031,7 @@ async def main():
                     url = s.get("url")
                     if q_filter != "ALL" and q != q_filter:
                         continue
-                    if url and not has_uploaded(movie_id, ep_idx, q):
+                    if url and not has_uploaded(movie_id, ep_idx, q, title=title):
                         pending.append({
                             "movie_id": movie_id,
                             "title": title,
@@ -2014,7 +2074,7 @@ async def main():
                 url = s.get("url")
                 if q_filter != "ALL" and q != q_filter:
                     continue
-                if url and not has_uploaded(movie_id, ep_idx, q):
+                if url and not has_uploaded(movie_id, ep_idx, q, title=title):
                     pending.append({
                         "movie_id": movie_id,
                         "title": title,
