@@ -225,6 +225,7 @@ class MasterBot:
         self.config = config
         self.db_path = db_path
         self.api = TelegramBotAPI(config.bot_token)
+        self.user_state: Dict[int, Dict[str, Any]] = {}
         init_db(self.db_path)
 
     def is_admin(self, user_id: int) -> bool:
@@ -235,10 +236,6 @@ class MasterBot:
         return user_id == self.config.admin_user_id
 
     def get_pending_downloads(self, movie_id: str = "") -> List[Dict[str, Any]]:
-        """
-        Fast lookup: checks single movie or latest 6 catalog movies,
-        filtering out already uploaded items.
-        """
         targets = []
         if movie_id:
             det = get_movie_details(movie_id)
@@ -246,7 +243,6 @@ class MasterBot:
             targets.append({"id": str(movie_id), "title": title})
         else:
             cat = get_latest_catalog()
-            # Fast check top 6 catalog items only to avoid blocking
             targets.extend(cat[:6])
 
         pending = []
@@ -283,20 +279,20 @@ class MasterBot:
         kb = build_menu_keyboard(self.config.mode, self.config.is_running, self.config.streamer_url)
         self.api.send_message(chat_id, text, reply_markup=kb)
 
-    def handle_token(self, chat_id: int | str, token: str) -> None:
+    def process_token_input(self, chat_id: int | str, user_id: int, token: str) -> None:
+        token = token.strip()
         if not token:
-            self.api.send_message(chat_id, "❌ Format salah. Ketik:\n`/token <railway_api_token>`")
+            self.api.send_message(chat_id, "❌ Token kosong. Silakan paste Token Railway Anda:")
             return
-        
+
         self.api.send_message(chat_id, "🔍 Memverifikasi token Railway...")
         user_info = verify_railway_token(token)
         if not user_info:
-            self.api.send_message(chat_id, "❌ Token Railway tidak valid atau ditolak oleh Railway API.")
+            kb = {"inline_keyboard": [[{"text": "🔙 Batal", "callback_data": "btn_cancel_state"}]]}
+            self.api.send_message(chat_id, "❌ Token Railway tidak valid atau ditolak oleh Railway API.\nSilakan kirim token yang benar:", reply_markup=kb)
             return
 
         email = user_info.get("email", "Unknown")
-        self.api.send_message(chat_id, f"✅ Token valid! Akun: `{email}`\nSedang auto-provisioning project & services...")
-        
         try:
             p_id, e_id, s_id = ensure_railway_project(token)
             self.config.set_token(token, email=email)
@@ -304,22 +300,68 @@ class MasterBot:
             self.config.railway_env_id = e_id
             self.config.railway_service_id = s_id
             self.config.save()
-            self.api.send_message(chat_id, f"🎉 Railway siap!\nProject: `{p_id}`\nService: `{s_id}`\nAkun: `{email}`")
         except Exception as e:
-            self.api.send_message(chat_id, f"⚠️ Token valid tapi auto-provisioning gagal: {e}")
+            self.api.send_message(chat_id, f"⚠️ Gagal auto-provisioning project di Railway: {e}")
+            return
+
+        state = self.user_state.pop(user_id, {})
+        action = state.get("action")
+        self.api.send_message(chat_id, f"✅ Token valid! Akun: `{email}`\n🚀 Menghubungkan worker Railway...")
+
+        if action == "auto":
+            self.handle_start_auto(chat_id, bypass_prompt=True)
+        elif action == "download":
+            self.handle_download(chat_id, state.get("movie_id", ""), bypass_prompt=True)
+        elif action == "single_ep":
+            self.handle_download_single_ep(chat_id, state.get("movie_id", ""), state.get("ep_id", ""), state.get("ep_idx", 0), bypass_prompt=True)
+        else:
+            self.api.send_message(chat_id, f"🎉 Akun Railway berhasil disimpan: `{email}`")
+            self.handle_start(chat_id)
+
+    def handle_token(self, chat_id: int | str, token: str) -> None:
+        user_id = int(chat_id)
+        if not token:
+            self.user_state[user_id] = {"action": "update_token", "waiting_for": "token"}
+            kb = {"inline_keyboard": [[{"text": "🔙 Batal", "callback_data": "btn_cancel_state"}]]}
+            self.api.send_message(chat_id, "🔑 **Masukkan Token Railway**\n\nSilakan langsung **paste Token Railway** Anda ke chat ini:", reply_markup=kb)
+            return
+        self.process_token_input(chat_id, user_id, token)
 
     def handle_mode(self, chat_id: int | str, new_mode: str = "") -> None:
         if new_mode in ("auto", "manual"):
             self.config.set_mode(new_mode)
         else:
             self.config.set_mode("manual" if self.config.mode == "auto" else "auto")
-        
         self.api.send_message(chat_id, f"🔄 Mode sistem diubah ke: **{self.config.mode.upper()}**")
 
-    def handle_start_auto(self, chat_id: int | str) -> None:
-        if not self.config.railway_token:
-            self.api.send_message(chat_id, "❌ Token Railway belum diatur! Pasang dulu dengan `/token <token>`.")
-            return
+    def handle_start_auto(self, chat_id: int | str, bypass_prompt: bool = False) -> None:
+        user_id = int(chat_id)
+        if not bypass_prompt:
+            if not self.config.railway_token:
+                self.user_state[user_id] = {"action": "auto", "waiting_for": "token"}
+                kb = {"inline_keyboard": [[{"text": "🔙 Batal", "callback_data": "btn_cancel_state"}]]}
+                self.api.send_message(
+                    chat_id,
+                    "🔑 **Masukkan Token Railway**\n\nUntuk memulai auto update di Railway, silakan **paste Token Railway** akun Anda langsung ke chat ini:",
+                    reply_markup=kb
+                )
+                return
+            else:
+                kb = {
+                    "inline_keyboard": [
+                        [{"text": "🚀 Jalankan dengan Token Saat Ini", "callback_data": "btn_confirm_start_auto"}],
+                        [{"text": "🔑 Input Token Baru", "callback_data": "btn_prompt_token_auto"}],
+                        [{"text": "🔙 Batal", "callback_data": "btn_menu"}]
+                    ]
+                }
+                text = (
+                    "🔑 **Verifikasi Akun Railway**\n"
+                    "──────────────────────────────\n"
+                    f"Akun saat ini: `{self.config.railway_email or 'Connected'}`\n\n"
+                    "Silakan pilih opsi untuk memulai:"
+                )
+                self.api.send_message(chat_id, text, reply_markup=kb)
+                return
 
         self.api.send_message(chat_id, "🔍 Memeriksa anime baru dari katalog...")
         pending = self.get_pending_downloads()
@@ -360,13 +402,38 @@ class MasterBot:
         self.config.set_status(is_running=True, progress_msg_id=prog_msg_id)
         self.api.send_message(chat_id, f"✅ Auto update anime berhasil dijalankan di Railway ({len(pending)} episode dalam antrean)!")
 
-    def handle_download(self, chat_id: int | str, movie_id: str) -> None:
-        if not self.config.railway_token:
-            self.api.send_message(chat_id, "❌ Token Railway belum diatur! Pasang dulu dengan `/token <token>`.")
-            return
+    def handle_download(self, chat_id: int | str, movie_id: str, bypass_prompt: bool = False) -> None:
+        user_id = int(chat_id)
         if not movie_id:
-            self.api.send_message(chat_id, "❌ Masukkan Anime ID. Contoh: `/download 6635`")
+            self.api.send_message(chat_id, "❌ Masukkan Anime ID atau pilih lewat tombol `[🎬 Katalog Anime]`.")
             return
+
+        if not bypass_prompt:
+            if not self.config.railway_token:
+                self.user_state[user_id] = {"action": "download", "movie_id": movie_id, "waiting_for": "token"}
+                kb = {"inline_keyboard": [[{"text": "🔙 Batal", "callback_data": f"anime_{movie_id}"}]]}
+                self.api.send_message(
+                    chat_id,
+                    f"🔑 **Masukkan Token Railway**\n\nSilakan **paste Token Railway** akun Anda langsung ke chat ini untuk mengunduh Anime `{movie_id}`:",
+                    reply_markup=kb
+                )
+                return
+            else:
+                kb = {
+                    "inline_keyboard": [
+                        [{"text": "🚀 Download dengan Akun Saat Ini", "callback_data": f"confirm_dlall_{movie_id}"}],
+                        [{"text": "🔑 Input Token Akun Lain", "callback_data": f"prompt_token_dl_{movie_id}"}],
+                        [{"text": "🔙 Kembali", "callback_data": f"anime_{movie_id}"}]
+                    ]
+                }
+                text = (
+                    f"🔑 **Konfirmasi Akun Railway**\n"
+                    f"Anime ID: `{movie_id}`\n"
+                    f"Akun saat ini: `{self.config.railway_email or 'Connected'}`\n\n"
+                    f"Silakan pilih opsi:"
+                )
+                self.api.send_message(chat_id, text, reply_markup=kb)
+                return
 
         pending = self.get_pending_downloads(movie_id=movie_id)
         if not pending:
@@ -403,9 +470,12 @@ class MasterBot:
         self.config.set_status(is_running=True, progress_msg_id=prog_msg_id)
         self.api.send_message(chat_id, f"✅ Manual download untuk Anime `{movie_id}` dimulai di Railway ({len(pending)} episode)!")
 
-    def handle_download_single_ep(self, chat_id: int | str, movie_id: str, ep_id: str, ep_idx: int) -> None:
-        if not self.config.railway_token:
-            self.api.send_message(chat_id, "❌ Token Railway belum diatur.")
+    def handle_download_single_ep(self, chat_id: int | str, movie_id: str, ep_id: str, ep_idx: int, bypass_prompt: bool = False) -> None:
+        user_id = int(chat_id)
+        if not bypass_prompt and not self.config.railway_token:
+            self.user_state[user_id] = {"action": "single_ep", "movie_id": movie_id, "ep_id": ep_id, "ep_idx": ep_idx, "waiting_for": "token"}
+            kb = {"inline_keyboard": [[{"text": "🔙 Batal", "callback_data": f"epmenu_{movie_id}"}]]}
+            self.api.send_message(chat_id, "🔑 **Masukkan Token Railway**\n\nSilakan **paste Token Railway** akun Anda ke chat ini:", reply_markup=kb)
             return
 
         det = get_movie_details(movie_id)
@@ -494,6 +564,20 @@ class MasterBot:
             self.api.send_message(chat_id, "⛔ Unauthorized. Akses ditolak.")
             return
 
+        # Check if user is in an input state (e.g. waiting for token paste)
+        if user_id in self.user_state and self.user_state[user_id].get("waiting_for") == "token":
+            if text.startswith("/cancel") or text.lower() == "batal":
+                self.user_state.pop(user_id, None)
+                self.api.send_message(chat_id, "❌ Pengisian token dibatalkan.")
+                self.handle_start(chat_id)
+                return
+
+            raw_token = text
+            if text.startswith("/token"):
+                _, raw_token = parse_command(text)
+            self.process_token_input(chat_id, user_id, raw_token)
+            return
+
         cmd, arg = parse_command(text)
         if cmd in ("start", "menu"):
             self.handle_start(chat_id)
@@ -528,6 +612,17 @@ class MasterBot:
 
         if data == "btn_start_auto":
             self.handle_start_auto(chat_id)
+        elif data == "btn_confirm_start_auto":
+            self.handle_start_auto(chat_id, bypass_prompt=True)
+        elif data == "btn_prompt_token_auto":
+            self.user_state[user_id] = {"action": "auto", "waiting_for": "token"}
+            kb = {"inline_keyboard": [[{"text": "🔙 Batal", "callback_data": "btn_cancel_state"}]]}
+            self.api.edit_message(
+                chat_id,
+                msg_id,
+                "🔑 **Silakan Kirim Token Railway Anda:**\n\nCukup **paste** token Railway Anda langsung ke chat ini (tanpa perlu ketik command).\nBot akan memverifikasi dan langsung memulai auto update!",
+                reply_markup=kb
+            )
         elif data == "btn_stop":
             self.handle_stop(chat_id)
         elif data == "btn_toggle_mode":
@@ -538,6 +633,11 @@ class MasterBot:
         elif data == "btn_status":
             self.handle_status(chat_id)
         elif data == "btn_menu":
+            text = format_menu_text(self.config.mode, self.config.is_running, self.config.railway_email)
+            kb = build_menu_keyboard(self.config.mode, self.config.is_running, self.config.streamer_url)
+            self.api.edit_message(chat_id, msg_id, text, reply_markup=kb)
+        elif data == "btn_cancel_state":
+            self.user_state.pop(user_id, None)
             text = format_menu_text(self.config.mode, self.config.is_running, self.config.railway_email)
             kb = build_menu_keyboard(self.config.mode, self.config.is_running, self.config.streamer_url)
             self.api.edit_message(chat_id, msg_id, text, reply_markup=kb)
@@ -556,6 +656,19 @@ class MasterBot:
         elif data.startswith("dlall_"):
             m_id = data.split("_")[1]
             self.handle_download(chat_id, m_id)
+        elif data.startswith("confirm_dlall_"):
+            m_id = data.split("_")[2]
+            self.handle_download(chat_id, m_id, bypass_prompt=True)
+        elif data.startswith("prompt_token_dl_"):
+            m_id = data.split("_")[3]
+            self.user_state[user_id] = {"action": "download", "movie_id": m_id, "waiting_for": "token"}
+            kb = {"inline_keyboard": [[{"text": "🔙 Batal", "callback_data": f"anime_{m_id}"}]]}
+            self.api.edit_message(
+                chat_id,
+                msg_id,
+                f"🔑 **Silakan Kirim Token Railway Anda:**\n\nCukup **paste** token Railway Anda ke chat ini untuk mengunduh Anime `{m_id}`:",
+                reply_markup=kb
+            )
         elif data.startswith("dlep_"):
             parts = data.split("_")
             m_id, ep_id, ep_idx = parts[1], parts[2], int(parts[3])
@@ -567,11 +680,24 @@ class MasterBot:
                 f"👤 **Akun Aktif:** `{self.config.railway_email or 'Belum diatur'}`\n"
                 f"📦 **Project:** `{self.config.railway_project_id or '-'}`\n"
                 f"⚙️ **Service:** `{self.config.railway_service_id or '-'}`\n\n"
-                "Untuk mengganti akun Railway, silakan ketik command:\n"
-                "`/token <railway_api_token>`"
+                "Klik tombol di bawah untuk memasukkan token baru:"
             )
-            kb = {"inline_keyboard": [[{"text": "🔙 Kembali ke Menu", "callback_data": "btn_menu"}]]}
+            kb = {
+                "inline_keyboard": [
+                    [{"text": "🔑 Masukkan / Ganti Token Baru", "callback_data": "btn_prompt_token_update"}],
+                    [{"text": "🔙 Kembali ke Menu", "callback_data": "btn_menu"}]
+                ]
+            }
             self.api.edit_message(chat_id, msg_id, text, reply_markup=kb)
+        elif data == "btn_prompt_token_update":
+            self.user_state[user_id] = {"action": "update_token", "waiting_for": "token"}
+            kb = {"inline_keyboard": [[{"text": "🔙 Batal", "callback_data": "btn_menu"}]]}
+            self.api.edit_message(
+                chat_id,
+                msg_id,
+                "🔑 **Ganti Akun Railway**\n\nSilakan **paste Token Railway baru** Anda langsung ke chat ini:\n(Bot akan otomatis memverifikasi)",
+                reply_markup=kb
+            )
 
     def run_polling(self) -> None:
         offset = 0

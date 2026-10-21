@@ -99,3 +99,21 @@ def test_full_button_keyboards():
         text_ep, kb_ep = build_episodes_keyboard("1", db_path="tests/test_tmp.sqlite")
         assert "Ep 1" in kb_ep["inline_keyboard"][0][0]["text"]
         assert kb_ep["inline_keyboard"][0][0]["callback_data"] == "dlep_1_ep1_1"
+
+def test_interactive_token_input_state():
+    cfg = Config(path=TEST_CONFIG_PATH)
+    cfg.admin_user_id = 12345
+    bot = MasterBot(cfg)
+    bot.api.send_message = MagicMock()
+
+    # User triggers token prompt
+    bot.user_state[12345] = {"action": "update_token", "waiting_for": "token"}
+    
+    mock_user_info = {"id": "uid-1", "email": "newuser@example.com"}
+    with patch("src.master_bot.verify_railway_token", return_value=mock_user_info), \
+         patch("src.master_bot.ensure_railway_project", return_value=("p-1", "e-1", "s-1")):
+        # User simply pastes token in chat
+        bot.dispatch_message({"chat": {"id": 12345}, "from": {"id": 12345}, "text": "my_new_railway_token"})
+        assert cfg.railway_token == "my_new_railway_token"
+        assert cfg.railway_email == "newuser@example.com"
+        assert 12345 not in bot.user_state
