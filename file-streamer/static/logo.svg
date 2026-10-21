@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 80" width="100%" height="100%">
+  <defs>
+    <linearGradient id="logo-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="50%" stop-color="#818cf8"/>
+      <stop offset="100%" stop-color="#c084fc"/>
+    </linearGradient>
+    <filter id="logo-glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="3" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+  <!-- Icon Symbol -->
+  <g transform="translate(10, 10)">
+    <rect width="60" height="60" rx="16" fill="#1e293b" stroke="url(#logo-grad)" stroke-width="2"/>
+    <polygon points="25,18 47,30 25,42" fill="url(#logo-grad)" filter="url(#logo-glow)"/>
+    <circle cx="45" cy="19" r="2.5" fill="#38bdf8"/>
+  </g>
+  <!-- Brand Text -->
+  <text x="85" y="44" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="800" font-size="28" fill="#f8fafc">
+    Nime<tspan fill="url(#logo-grad)">Bot</tspan>
+  </text>
+  <rect x="205" y="24" width="60" height="22" rx="6" fill="#38bdf8" fill-opacity="0.15" stroke="#38bdf8" stroke-width="1.2"/>
+  <text x="217" y="39" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" font-size="11" fill="#38bdf8" letter-spacing="1">AUTO</text>
+  <text x="86" y="62" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" fill="#94a3b8" letter-spacing="0.5">
+    Anime Streaming &amp; Media API
+  </text>
+</svg>

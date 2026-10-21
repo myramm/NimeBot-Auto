@@ -5,6 +5,8 @@
 __pycache__/
 *.pyc
 *.sqlite
+!file-streamer/anime_db.sqlite
+*.session
 *.log
 config.json
 monitor_and_stop.py

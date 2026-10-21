@@ -58,14 +58,28 @@ def is_authorized(user_id: int) -> bool:
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS anime_series (
+            title TEXT PRIMARY KEY,
+            slug TEXT,
+            cover_msg_id INTEGER,
+            anime_type TEXT,
+            studio TEXT,
+            year TEXT,
+            genres TEXT,
+            status TEXT,
+            total_episodes INTEGER,
+            synopsis TEXT
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS records (
             movie_id TEXT,
             ep_index INTEGER,
             quality TEXT,
-            msg_id INTEGER,
+            msg_id INTEGER PRIMARY KEY,
             anime_title TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY(movie_id, ep_index, quality)
+            file_size INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.execute("""
@@ -75,47 +89,30 @@ def init_db():
         )
     """)
     conn.commit()
-
-    # Pre-seed Macross F and Yami Shibai 15 if empty
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM records")
-    count = c.fetchone()[0]
-    if count == 0:
-        logging.info("Seeding historical completed uploads into database...")
-        for ep in range(1, 12):
-            conn.execute("INSERT OR REPLACE INTO records (movie_id, ep_index, quality, msg_id, anime_title) VALUES (?, ?, ?, ?, ?)",
-                         ("158", ep, "720p", 2700 + ep, "Macross F"))
-            conn.execute("INSERT OR REPLACE INTO records (movie_id, ep_index, quality, msg_id, anime_title) VALUES (?, ?, ?, ?, ?)",
-                         ("158", ep, "1080p", 2800 + ep, "Macross F"))
-        for ep in range(1, 14):
-            conn.execute("INSERT OR REPLACE INTO records (movie_id, ep_index, quality, msg_id, anime_title) VALUES (?, ?, ?, ?, ?)",
-                         ("6635", ep, "720p", 3000 + ep, "Yami Shibai 15"))
-            conn.execute("INSERT OR REPLACE INTO records (movie_id, ep_index, quality, msg_id, anime_title) VALUES (?, ?, ?, ?, ?)",
-                         ("6635", ep, "1080p", 3100 + ep, "Yami Shibai 15"))
-            conn.execute("INSERT OR REPLACE INTO records (movie_id, ep_index, quality, msg_id, anime_title) VALUES (?, ?, ?, ?, ?)",
-                         ("6635", ep, "480p", 3150 + ep, "Yami Shibai 15"))
-        conn.commit()
     conn.close()
 
-def has_uploaded(movie_id: str, ep_index: int, quality: str) -> bool:
+def has_uploaded(movie_id: str, ep_index: int, quality: str, title: str = "") -> bool:
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM records WHERE movie_id = ? AND ep_index = ? AND quality = ?", (str(movie_id), int(ep_index), str(quality)))
+    if title:
+        cursor.execute("SELECT 1 FROM records WHERE (movie_id = ? OR anime_title = ?) AND ep_index = ? AND quality = ?", (str(movie_id), str(title), int(ep_index), str(quality)))
+    else:
+        cursor.execute("SELECT 1 FROM records WHERE movie_id = ? AND ep_index = ? AND quality = ?", (str(movie_id), int(ep_index), str(quality)))
     row = cursor.fetchone()
     conn.close()
     return row is not None
 
-def record_upload(movie_id: str, ep_index: int, quality: str, msg_id: int, title: str):
+def record_upload(movie_id: str, ep_index: int, quality: str, msg_id: int, title: str, file_size: int = 0):
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("INSERT OR REPLACE INTO records (movie_id, ep_index, quality, msg_id, anime_title) VALUES (?, ?, ?, ?, ?)",
-                 (str(movie_id), int(ep_index), str(quality), int(msg_id), str(title)))
+    conn.execute("INSERT OR REPLACE INTO records (movie_id, ep_index, quality, msg_id, anime_title, file_size) VALUES (?, ?, ?, ?, ?, ?)",
+                 (str(movie_id), int(ep_index), str(quality), int(msg_id), str(title), int(file_size)))
     conn.commit()
     conn.close()
 
 def get_record_by_msg_id(msg_id: int) -> Optional[Dict[str, Any]]:
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT movie_id, ep_index, quality, msg_id, anime_title, created_at FROM records WHERE msg_id = ?", (msg_id,))
+    cursor.execute("SELECT movie_id, ep_index, quality, msg_id, anime_title, created_at, file_size FROM records WHERE msg_id = ?", (msg_id,))
     row = cursor.fetchone()
     conn.close()
     if row:
@@ -125,14 +122,15 @@ def get_record_by_msg_id(msg_id: int) -> Optional[Dict[str, Any]]:
             "quality": row[2],
             "msg_id": row[3],
             "anime_title": row[4],
-            "created_at": row[5]
+            "created_at": row[5],
+            "file_size": row[6] or 0
         }
     return None
 
 def get_recent_uploads(limit: int = 40) -> List[Dict[str, Any]]:
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT movie_id, ep_index, quality, msg_id, anime_title, created_at FROM records ORDER BY created_at DESC LIMIT ?", (limit,))
+    cursor.execute("SELECT movie_id, ep_index, quality, msg_id, anime_title, created_at, file_size FROM records ORDER BY msg_id DESC LIMIT ?", (limit,))
     rows = cursor.fetchall()
     conn.close()
     return [{
@@ -141,8 +139,221 @@ def get_recent_uploads(limit: int = 40) -> List[Dict[str, Any]]:
         "quality": r[2],
         "msg_id": r[3],
         "anime_title": r[4],
-        "created_at": r[5]
+        "created_at": r[5],
+        "file_size": r[6] or 0
     } for r in rows]
+
+def get_all_anime(search: Optional[str] = None, genre: Optional[str] = None, status: Optional[str] = None, page: int = 1, limit: int = 50) -> Dict[str, Any]:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    query = "SELECT title, slug, cover_msg_id, anime_type, studio, year, genres, status, total_episodes, synopsis FROM anime_series WHERE 1=1"
+    params = []
+    if search:
+        query += " AND (title LIKE ? OR synopsis LIKE ?)"
+        params.extend([f"%{search}%", f"%{search}%"])
+    if genre:
+        query += " AND genres LIKE ?"
+        params.append(f"%{genre}%")
+    if status:
+        query += " AND status LIKE ?"
+        params.append(f"%{status}%")
+
+    count_query = f"SELECT COUNT(*) FROM ({query})"
+    cursor.execute(count_query, params)
+    total_count = cursor.fetchone()[0]
+
+    offset = (page - 1) * limit
+    query += " ORDER BY title ASC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+
+    results = []
+    for r in rows:
+        title = r[0]
+        cursor.execute("SELECT COUNT(DISTINCT ep_index), GROUP_CONCAT(DISTINCT quality) FROM records WHERE anime_title = ?", (title,))
+        ep_stats = cursor.fetchone()
+        avail_eps = ep_stats[0] if ep_stats else 0
+        qualities_str = ep_stats[1] if ep_stats and ep_stats[1] else ""
+        qualities = [q.strip() for q in qualities_str.split(",") if q.strip()] if qualities_str else []
+
+        cover_id = r[2]
+        cover_url = f"{STREAMER_URL}/cover/{cover_id}.jpg" if cover_id else f"{STREAMER_URL}/icon.svg"
+
+        results.append({
+            "title": title,
+            "slug": r[1],
+            "cover_url": cover_url,
+            "cover_msg_id": cover_id,
+            "type": r[3],
+            "studio": r[4],
+            "year": r[5],
+            "genres": [g.strip() for g in r[6].split(",") if g.strip()] if r[6] else [],
+            "status": r[7],
+            "total_episodes": r[8],
+            "available_episodes": avail_eps,
+            "qualities": qualities,
+            "synopsis": r[9],
+            "detail_url": f"/api/anime/{r[1]}"
+        })
+    conn.close()
+    return {
+        "page": page,
+        "limit": limit,
+        "total": total_count,
+        "total_pages": (total_count + limit - 1) // limit if limit > 0 else 1,
+        "anime": results
+    }
+
+def get_anime_detail(slug_or_title: str) -> Optional[Dict[str, Any]]:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT title, slug, cover_msg_id, anime_type, studio, year, genres, status, total_episodes, synopsis
+        FROM anime_series
+        WHERE slug = ? OR LOWER(title) = LOWER(?)
+    """, (slug_or_title.lower(), slug_or_title))
+    row = cursor.fetchone()
+
+    if not row:
+        cursor.execute("SELECT DISTINCT anime_title FROM records WHERE anime_title LIKE ? LIMIT 1", (f"%{slug_or_title}%",))
+        fallback = cursor.fetchone()
+        if not fallback:
+            conn.close()
+            return None
+        title = fallback[0]
+        slug = re.sub(r"[^a-zA-Z0-9]+", "-", title.lower()).strip("-")
+        row = (title, slug, None, "SERIES", "", "", "", "UNKNOWN", 0, "")
+
+    title = row[0]
+    cover_id = row[2]
+    cover_url = f"{STREAMER_URL}/cover/{cover_id}.jpg" if cover_id else f"{STREAMER_URL}/icon.svg"
+
+    cursor.execute("""
+        SELECT ep_index, quality, msg_id, file_size
+        FROM records
+        WHERE anime_title = ?
+        ORDER BY ep_index ASC, quality ASC
+    """, (title,))
+    ep_rows = cursor.fetchall()
+    conn.close()
+
+    episodes_map = {}
+    for ep_idx, quality, msg_id, file_size in ep_rows:
+        if ep_idx not in episodes_map:
+            episodes_map[ep_idx] = {
+                "episode": ep_idx,
+                "qualities": {}
+            }
+        size_fmt = f"{file_size / (1024*1024):.1f} MB" if file_size else "Video MP4"
+        episodes_map[ep_idx]["qualities"][quality] = {
+            "msg_id": msg_id,
+            "quality": quality,
+            "file_size": file_size,
+            "file_size_formatted": size_fmt,
+            "stream_url": f"{STREAMER_URL}/stream/{msg_id}",
+            "watch_url": f"{STREAMER_URL}/watch/{msg_id}",
+            "download_url": f"{STREAMER_URL}/download/{msg_id}"
+        }
+
+    return {
+        "title": title,
+        "slug": row[1],
+        "cover_url": cover_url,
+        "cover_msg_id": cover_id,
+        "type": row[3],
+        "studio": row[4],
+        "year": row[5],
+        "genres": [g.strip() for g in row[6].split(",") if g.strip()] if row[6] else [],
+        "status": row[7],
+        "total_episodes": row[8],
+        "available_episodes_count": len(episodes_map),
+        "synopsis": row[9],
+        "episodes": list(episodes_map.values())
+    }
+
+def get_all_episodes(page: int = 1, limit: int = 50, anime_title: Optional[str] = None, quality: Optional[str] = None) -> Dict[str, Any]:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    query = "SELECT movie_id, ep_index, quality, msg_id, anime_title, file_size, created_at FROM records WHERE 1=1"
+    params = []
+    if anime_title:
+        query += " AND anime_title LIKE ?"
+        params.append(f"%{anime_title}%")
+    if quality:
+        query += " AND quality = ?"
+        params.append(quality)
+
+    count_query = f"SELECT COUNT(*) FROM ({query})"
+    cursor.execute(count_query, params)
+    total_count = cursor.fetchone()[0]
+
+    offset = (page - 1) * limit
+    query += " ORDER BY msg_id DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    conn.close()
+
+    items = []
+    for r in rows:
+        msg_id = r[3]
+        fsize = r[5] or 0
+        items.append({
+            "anime_title": r[4],
+            "episode": r[1],
+            "quality": r[2],
+            "msg_id": msg_id,
+            "file_size": fsize,
+            "file_size_formatted": f"{fsize / (1024*1024):.1f} MB" if fsize else "Video MP4",
+            "stream_url": f"{STREAMER_URL}/stream/{msg_id}",
+            "watch_url": f"{STREAMER_URL}/watch/{msg_id}",
+            "download_url": f"{STREAMER_URL}/download/{msg_id}",
+            "created_at": r[6]
+        })
+    return {
+        "page": page,
+        "limit": limit,
+        "total": total_count,
+        "total_pages": (total_count + limit - 1) // limit if limit > 0 else 1,
+        "episodes": items
+    }
+
+def get_api_stats() -> Dict[str, Any]:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM anime_series")
+    total_anime = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*), SUM(COALESCE(file_size, 0)) FROM records")
+    ep_row = cursor.fetchone()
+    total_episodes = ep_row[0] if ep_row else 0
+    total_bytes = ep_row[1] if ep_row and ep_row[1] else 0
+    conn.close()
+
+    return {
+        "status": "online",
+        "service": "NimeBot Auto Streaming & Media API",
+        "version": "2.1.0",
+        "total_anime": total_anime,
+        "total_episodes": total_episodes,
+        "total_storage_bytes": total_bytes,
+        "total_storage_gb": round(total_bytes / (1024 ** 3), 2),
+        "channel_id": LOG_CHANNEL,
+        "endpoints": {
+            "api_docs": f"{STREAMER_URL}/api",
+            "stats": f"{STREAMER_URL}/api/stats",
+            "anime_list": f"{STREAMER_URL}/api/anime",
+            "anime_detail": f"{STREAMER_URL}/api/anime/{{slug}}",
+            "episodes": f"{STREAMER_URL}/api/episodes",
+            "cover_media": f"{STREAMER_URL}/cover/{{cover_msg_id}}.jpg",
+            "stream_video": f"{STREAMER_URL}/stream/{{msg_id}}",
+            "watch_video": f"{STREAMER_URL}/watch/{{msg_id}}",
+            "download_video": f"{STREAMER_URL}/download/{{msg_id}}",
+            "favicon_svg": f"{STREAMER_URL}/favicon.svg",
+            "logo_svg": f"{STREAMER_URL}/logo.svg",
+            "icon_svg": f"{STREAMER_URL}/icon.svg"
+        }
+    }
 
 # ----------------- CONFIGURABLE SCRAPER SETTINGS -----------------
 def get_scraper_config(key: str, default: str) -> str:
@@ -318,8 +529,9 @@ def build_menu(mode: str, is_running: bool) -> Tuple[str, List[List[Button]]]:
         [start_btn],
         [Button.inline(mode_text, b"btn_toggle_mode"), Button.inline("🎬 Katalog Anime", b"btn_cat_0")],
         [Button.inline("⚙️ Konfigurasi Scraper", b"btn_scraper_menu"), Button.inline("🔑 Ganti Token Railway", b"btn_token_info")],
+        [Button.inline("🔄 Sync Channel (2,877+ Eps)", b"btn_sync_channel"), Button.inline("🌐 Info REST API", b"btn_api_info")],
         [Button.inline("📊 Status & Info", b"btn_status"), Button.inline("🔄 Refresh Menu", b"btn_menu")],
-        [Button.url("🌐 Web Streamer", STREAMER_URL)]
+        [Button.url("🌐 Web Portal & API", STREAMER_URL)]
     ]
     return text, buttons
 
@@ -573,77 +785,430 @@ async def run_transfer_pipeline(client: TelegramClient, chat_id: int, prog_msg_i
     finally:
         IS_RUNNING = False
 
-# ----------------- EMBEDDED AIOHTTP WEB STREAMER -----------------
+# ----------------- EMBEDDED AIOHTTP WEB STREAMER & REST API -----------------
 def create_web_app(tg_client: TelegramClient) -> web.Application:
     app = web.Application()
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    static_dir = os.path.join(base_dir, "static")
+    covers_dir = os.path.join(base_dir, "covers")
+    os.makedirs(static_dir, exist_ok=True)
+    os.makedirs(covers_dir, exist_ok=True)
 
+    # 1. Static Media Handlers (SVG Icons, Favicon, Brand Logo)
+    async def handle_favicon(request: web.Request) -> web.Response:
+        fav_path = os.path.join(static_dir, "favicon.svg")
+        if os.path.exists(fav_path):
+            return web.FileResponse(fav_path, headers={"Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=86400"})
+        return web.Response(text="<svg></svg>", content_type="image/svg+xml")
+
+    async def handle_logo(request: web.Request) -> web.Response:
+        logo_path = os.path.join(static_dir, "logo.svg")
+        if os.path.exists(logo_path):
+            return web.FileResponse(logo_path, headers={"Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=86400"})
+        return web.Response(text="<svg></svg>", content_type="image/svg+xml")
+
+    async def handle_icon(request: web.Request) -> web.Response:
+        icon_path = os.path.join(static_dir, "icon.svg")
+        if os.path.exists(icon_path):
+            return web.FileResponse(icon_path, headers={"Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=86400"})
+        return web.Response(text="<svg></svg>", content_type="image/svg+xml")
+
+    # 2. Cover Poster Media Handler (High-res JPG direct & cached)
+    async def handle_cover(request: web.Request) -> web.StreamResponse:
+        raw_id = request.match_info.get("msg_id", "").replace(".jpg", "")
+        try:
+            msg_id = int(raw_id)
+        except ValueError:
+            return web.Response(status=400, text="ID Cover tidak valid")
+
+        cached_file = os.path.join(covers_dir, f"{msg_id}.jpg")
+        if os.path.exists(cached_file):
+            return web.FileResponse(cached_file, headers={"Content-Type": "image/jpeg", "Cache-Control": "public, max-age=604800"})
+
+        # Not in local cache, download from Telegram
+        try:
+            msg = await tg_client.get_messages(LOG_CHANNEL, ids=msg_id)
+        except Exception as e:
+            logging.error(f"Error fetching cover message {msg_id}: {e}")
+            return web.Response(status=502, text=f"Error Telegram: {e}")
+
+        if not msg or not (msg.photo or (msg.media and hasattr(msg.media, "document"))):
+            return await handle_icon(request)
+
+        media = msg.photo or msg.media
+        try:
+            await tg_client.download_media(media, file=cached_file)
+            if os.path.exists(cached_file):
+                return web.FileResponse(cached_file, headers={"Content-Type": "image/jpeg", "Cache-Control": "public, max-age=604800"})
+        except Exception as e:
+            logging.error(f"Error downloading cover {msg_id}: {e}")
+
+        return await handle_icon(request)
+
+    # 3. REST API Handlers
+    async def handle_api_index(request: web.Request) -> web.Response:
+        stats = get_api_stats()
+        return web.json_response({
+            "status": "success",
+            "message": "NimeBot Auto Streaming & Anime Media REST API",
+            "version": "2.1.0",
+            "base_url": STREAMER_URL,
+            "stats": stats,
+            "endpoints": {
+                "GET /api/stats": "Overall statistics of indexed anime, episodes, and storage",
+                "GET /api/anime": "List of all indexed anime series (params: page, limit, search, genre, status)",
+                "GET /api/anime/{slug}": "Full anime details and all episodes grouped by quality with media URLs",
+                "GET /api/episodes": "Flat paginated list of all episodes (params: page, limit, anime, quality)",
+                "GET /cover/{cover_msg_id}.jpg": "Direct JPG cover poster image",
+                "GET /stream/{msg_id}": "Direct video stream (supports HTTP 206 Partial Content Range)",
+                "GET /watch/{msg_id}": "HTML5 web video player",
+                "GET /download/{msg_id}": "Direct file download attachment",
+                "GET /favicon.svg": "SVG Favicon",
+                "GET /logo.svg": "SVG Brand Logo",
+                "GET /icon.svg": "SVG Icon"
+            }
+        })
+
+    async def handle_api_stats(request: web.Request) -> web.Response:
+        return web.json_response(get_api_stats())
+
+    async def handle_api_anime(request: web.Request) -> web.Response:
+        search = request.query.get("search")
+        genre = request.query.get("genre")
+        status = request.query.get("status")
+        try:
+            page = max(1, int(request.query.get("page", 1)))
+            limit = min(100, max(1, int(request.query.get("limit", 50))))
+        except ValueError:
+            page, limit = 1, 50
+        res = get_all_anime(search=search, genre=genre, status=status, page=page, limit=limit)
+        return web.json_response({"status": "success", **res})
+
+    async def handle_api_anime_detail(request: web.Request) -> web.Response:
+        slug = request.match_info["slug"]
+        detail = get_anime_detail(slug)
+        if not detail:
+            return web.json_response({"status": "error", "message": f"Anime '{slug}' tidak ditemukan"}, status=404)
+        return web.json_response({"status": "success", "data": detail})
+
+    async def handle_api_episodes(request: web.Request) -> web.Response:
+        anime = request.query.get("anime")
+        quality = request.query.get("quality")
+        try:
+            page = max(1, int(request.query.get("page", 1)))
+            limit = min(100, max(1, int(request.query.get("limit", 50))))
+        except ValueError:
+            page, limit = 1, 50
+        res = get_all_episodes(page=page, limit=limit, anime_title=anime, quality=quality)
+        return web.json_response({"status": "success", **res})
+
+    # 4. Web UI Portal Handlers
     async def handle_index(request: web.Request) -> web.Response:
-        records = get_recent_uploads(50)
-        cards_html = ""
-        for r in records:
+        stats = get_api_stats()
+        anime_data = get_all_anime(limit=60)["anime"]
+        recent_records = get_recent_uploads(24)
+
+        # Anime Series Catalog Cards with Real JPG Covers
+        catalog_html = ""
+        for a in anime_data:
+            cover_url = a["cover_url"]
+            title = a["title"]
+            slug = a["slug"]
+            eps_avail = a["available_episodes"]
+            qualities = " • ".join(a["qualities"][:3]) if a["qualities"] else "HD"
+            genres_pills = "".join([f'<span class="genre-pill">{g}</span>' for g in a["genres"][:2]])
+
+            catalog_html += f"""
+            <div class="anime-card">
+                <div class="anime-poster-wrapper">
+                    <img src="{cover_url}" alt="{title}" class="anime-poster" loading="lazy" onerror="this.src='/icon.svg'">
+                    <span class="eps-badge">{eps_avail} Eps</span>
+                </div>
+                <div class="anime-content">
+                    <h3 class="anime-title" title="{title}">{title}</h3>
+                    <div class="anime-meta">{qualities}</div>
+                    <div class="genre-container">{genres_pills}</div>
+                    <a href="/anime/{slug}" class="btn btn-primary">▶️ Lihat Episode</a>
+                </div>
+            </div>
+            """
+
+        # Recent Episodes Cards
+        recent_html = ""
+        for r in recent_records:
             msg_id = r["msg_id"]
             title = r["anime_title"]
             ep = r["ep_index"]
             q = r["quality"]
-            cards_html += f"""
-            <div class="card">
-                <div class="card-title">🎬 {title}</div>
-                <div class="card-meta">Episode {ep} • <span class="badge">{q}</span></div>
+            fsize = f"{r['file_size'] / (1024*1024):.1f} MB" if r["file_size"] else "MP4"
+            recent_html += f"""
+            <div class="rec-card">
+                <div class="rec-title">🎬 {title}</div>
+                <div class="rec-meta">Ep {ep} • <span class="badge">{q}</span> • {fsize}</div>
                 <div class="card-actions">
-                    <a href="/watch/{msg_id}" class="btn">▶️ Nonton</a>
-                    <a href="/download/{msg_id}" class="btn btn-sec">📥 Download</a>
+                    <a href="/watch/{msg_id}" class="btn btn-sm">▶️ Nonton</a>
+                    <a href="/download/{msg_id}" class="btn btn-sm btn-sec">📥 Unduh</a>
                 </div>
             </div>
             """
-        if not cards_html:
-            cards_html = "<p style='color: #94a3b8; text-align: center;'>Belum ada episode anime yang diunggah.</p>"
 
         html = f"""<!DOCTYPE html>
 <html lang="id">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NimeBot Auto - Web Streamer Portal</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+    <title>NimeBot Auto - Streaming & Anime Media API</title>
     <style>
         * {{ box-sizing: border-box; margin: 0; padding: 0; }}
         body {{
-            background: #0f172a; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            padding: 30px 16px; min-height: 100vh;
+            background: #090d16; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            padding: 0; min-height: 100vh;
         }}
-        .header {{ text-align: center; margin-bottom: 30px; }}
-        .header h1 {{ font-size: 26px; margin-bottom: 8px; color: #38bdf8; }}
-        .header p {{ color: #94a3b8; font-size: 15px; }}
-        .grid {{
-            display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-            gap: 16px; max-width: 1100px; margin: 0 auto;
+        .navbar {{
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 16px 32px; background: #0f172a; border-bottom: 1px solid #1e293b;
+            position: sticky; top: 0; z-index: 50;
         }}
-        .card {{
-            background: #1e293b; border-radius: 12px; padding: 18px; border: 1px solid #334155;
+        .logo-img {{ height: 38px; }}
+        .nav-links {{ display: flex; gap: 14px; align-items: center; }}
+        .nav-btn {{
+            background: #1e293b; color: #38bdf8; text-decoration: none; padding: 7px 14px;
+            border-radius: 8px; font-size: 13px; font-weight: 600; border: 1px solid #334155;
+            transition: all 0.2s;
+        }}
+        .nav-btn:hover {{ background: #38bdf8; color: #0f172a; }}
+        .hero {{
+            text-align: center; padding: 45px 20px 25px;
+            background: radial-gradient(circle at 50% 20%, rgba(56, 189, 248, 0.12), transparent 70%);
+        }}
+        .hero h1 {{ font-size: 32px; font-weight: 800; margin-bottom: 10px; color: #f8fafc; }}
+        .hero h1 span {{ color: #38bdf8; }}
+        .hero p {{ color: #94a3b8; font-size: 16px; max-width: 650px; margin: 0 auto 20px; }}
+        .stats-bar {{
+            display: inline-flex; gap: 16px; background: #1e293b; padding: 8px 20px;
+            border-radius: 999px; border: 1px solid #334155; font-size: 13px; color: #cbd5e1;
+            flex-wrap: wrap; justify-content: center;
+        }}
+        .stats-bar strong {{ color: #38bdf8; }}
+        .container {{ max-width: 1200px; margin: 0 auto; padding: 30px 20px; }}
+        .section-header {{
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 22px; border-bottom: 1px solid #1e293b; padding-bottom: 12px;
+        }}
+        .section-title {{ font-size: 20px; font-weight: 700; color: #f1f5f9; display: flex; align-items: center; gap: 8px; }}
+        .anime-grid {{
+            display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+            gap: 20px; margin-bottom: 50px;
+        }}
+        .anime-card {{
+            background: #111827; border-radius: 12px; overflow: hidden; border: 1px solid #1f2937;
+            display: flex; flex-direction: column; transition: transform 0.2s, box-shadow 0.2s;
+        }}
+        .anime-card:hover {{
+            transform: translateY(-4px); box-shadow: 0 12px 24px -8px rgba(56, 189, 248, 0.2);
+            border-color: #38bdf8;
+        }}
+        .anime-poster-wrapper {{ position: relative; width: 100%; aspect-ratio: 3 / 4; background: #1f2937; }}
+        .anime-poster {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
+        .eps-badge {{
+            position: absolute; top: 8px; right: 8px; background: rgba(15, 23, 42, 0.85);
+            backdrop-filter: blur(4px); color: #38bdf8; font-size: 11px; font-weight: 700;
+            padding: 3px 8px; border-radius: 6px; border: 1px solid rgba(56, 189, 248, 0.4);
+        }}
+        .anime-content {{ padding: 12px; display: flex; flex-direction: column; flex-grow: 1; }}
+        .anime-title {{
+            font-size: 14px; font-weight: 700; color: #f8fafc; margin-bottom: 6px;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }}
+        .anime-meta {{ color: #94a3b8; font-size: 12px; margin-bottom: 8px; }}
+        .genre-container {{ display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 12px; }}
+        .genre-pill {{ background: #1e293b; color: #94a3b8; font-size: 10px; padding: 2px 6px; border-radius: 4px; }}
+        .btn {{
+            display: block; text-align: center; background: #2563eb; color: white; text-decoration: none;
+            padding: 8px 10px; border-radius: 6px; font-size: 12px; font-weight: 600; transition: background 0.2s;
+        }}
+        .btn:hover {{ background: #1d4ed8; }}
+        .btn-sec {{ background: #334155; }}
+        .btn-sec:hover {{ background: #475569; }}
+        .btn-sm {{ padding: 6px 10px; font-size: 12px; }}
+        .rec-grid {{
+            display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+            gap: 14px;
+        }}
+        .rec-card {{
+            background: #111827; border-radius: 10px; padding: 14px; border: 1px solid #1f2937;
             display: flex; flex-direction: column; justify-content: space-between;
         }}
-        .card-title {{ font-size: 16px; font-weight: 700; color: #f1f5f9; margin-bottom: 8px; }}
-        .card-meta {{ color: #94a3b8; font-size: 13px; margin-bottom: 16px; }}
+        .rec-title {{ font-size: 14px; font-weight: 700; color: #f1f5f9; margin-bottom: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+        .rec-meta {{ color: #94a3b8; font-size: 12px; margin-bottom: 12px; }}
         .badge {{ background: #3b82f6; color: white; padding: 2px 6px; border-radius: 4px; font-size: 11px; }}
         .card-actions {{ display: flex; gap: 8px; }}
-        .btn {{
-            flex: 1; text-align: center; background: #2563eb; color: white; text-decoration: none;
-            padding: 8px 12px; border-radius: 6px; font-size: 13px; font-weight: 600;
-        }}
-        .btn-sec {{ background: #334155; }}
-        .btn:hover {{ opacity: 0.9; }}
-        footer {{ text-align: center; margin-top: 40px; color: #64748b; font-size: 13px; }}
+        .card-actions .btn {{ flex: 1; }}
+        footer {{ text-align: center; padding: 40px 20px; color: #64748b; font-size: 13px; border-top: 1px solid #1e293b; margin-top: 60px; }}
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1>🤖 NimeBot Auto - Web Streamer</h1>
-        <p>Streaming & Direct Download Anime Cepat Berbasis Cloud Telegram & Railway</p>
+    <header class="navbar">
+        <a href="/"><img src="/logo.svg" alt="NimeBot Logo" class="logo-img"></a>
+        <div class="nav-links">
+            <a href="/api" class="nav-btn">⚡ REST API Docs</a>
+            <a href="/api/stats" class="nav-btn">📊 Stats JSON</a>
+        </div>
+    </header>
+
+    <div class="hero">
+        <h1>NimeBot <span>Auto</span> Media &amp; Streaming</h1>
+        <p>Pusat Streaming &amp; REST API Anime Telegram Berkecepatan Tinggi di Cloud Railway</p>
+        <div class="stats-bar">
+            <span>📺 <strong>{stats['total_episodes']}</strong> Episode</span>
+            <span>🎬 <strong>{stats['total_anime']}</strong> Anime Series</span>
+            <span>💾 <strong>{stats['total_storage_gb']} GB</strong> Video Storage</span>
+            <span>⚡ <strong>HTTP 206</strong> Fast Seeking</span>
+        </div>
     </div>
-    <div class="grid">
-        {cards_html}
-    </div>
+
+    <main class="container">
+        <div class="section-header">
+            <h2 class="section-title">🎬 Koleksi Anime ({stats['total_anime']})</h2>
+            <a href="/api/anime" class="nav-btn" style="font-size: 12px;">Lihat Format API JSON &rarr;</a>
+        </div>
+        <div class="anime-grid">
+            {catalog_html}
+        </div>
+
+        <div class="section-header">
+            <h2 class="section-title">🔥 Unggahan Episode Terbaru</h2>
+            <a href="/api/episodes" class="nav-btn" style="font-size: 12px;">Endpoint Episodes &rarr;</a>
+        </div>
+        <div class="rec-grid">
+            {recent_html}
+        </div>
+    </main>
+
     <footer>
-        &copy; 2026 NimeBot Auto Cloud • Running on Railway
+        &copy; 2026 NimeBot Auto • Streaming &amp; Media API • Running 24/7 on Railway
+    </footer>
+</body>
+</html>"""
+        return web.Response(text=html, content_type="text/html")
+
+    async def handle_anime_page(request: web.Request) -> web.Response:
+        slug = request.match_info["slug"]
+        detail = get_anime_detail(slug)
+        if not detail:
+            return web.Response(text=f"Anime '{slug}' tidak ditemukan.", status=404)
+
+        title = detail["title"]
+        cover_url = detail["cover_url"]
+        synopsis = detail["synopsis"] or "Tidak ada sinopsis tersedia untuk anime ini."
+        year = detail["year"] or "-"
+        studio = detail["studio"] or "-"
+        atype = detail["type"] or "SERIES"
+        status = detail["status"] or "FINISHED"
+        genres = " • ".join(detail["genres"]) if detail["genres"] else "Anime"
+
+        eps_html = ""
+        for ep_obj in detail["episodes"]:
+            ep_num = ep_obj["episode"]
+            q_buttons = ""
+            for q_name, q_info in sorted(ep_obj["qualities"].items()):
+                msg_id = q_info["msg_id"]
+                q_buttons += f"""
+                <div class="ep-quality-pill">
+                    <span class="q-tag">{q_name}</span>
+                    <a href="/watch/{msg_id}" class="ep-btn">▶️ Nonton</a>
+                    <a href="/download/{msg_id}" class="ep-btn ep-btn-dl">📥 Unduh</a>
+                </div>
+                """
+            eps_html += f"""
+            <div class="ep-row">
+                <div class="ep-label">Episode {ep_num}</div>
+                <div class="ep-qualities">{q_buttons}</div>
+            </div>
+            """
+
+        html = f"""<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+    <title>{title} | NimeBot Auto</title>
+    <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{
+            background: #090d16; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            padding: 0; min-height: 100vh;
+        }}
+        .navbar {{
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 16px 32px; background: #0f172a; border-bottom: 1px solid #1e293b;
+        }}
+        .logo-img {{ height: 38px; }}
+        .nav-btn {{
+            background: #1e293b; color: #38bdf8; text-decoration: none; padding: 7px 14px;
+            border-radius: 8px; font-size: 13px; font-weight: 600; border: 1px solid #334155;
+        }}
+        .container {{ max-width: 1000px; margin: 30px auto; padding: 0 20px; }}
+        .anime-header {{
+            display: flex; gap: 30px; background: #111827; border-radius: 16px; padding: 24px;
+            border: 1px solid #1f2937; margin-bottom: 30px; flex-wrap: wrap;
+        }}
+        .poster {{ width: 220px; aspect-ratio: 3/4; object-fit: cover; border-radius: 10px; border: 1px solid #334155; }}
+        .header-content {{ flex: 1; min-width: 280px; display: flex; flex-direction: column; justify-content: center; }}
+        .badge-type {{ display: inline-block; background: #38bdf8; color: #0f172a; font-weight: 800; font-size: 11px; padding: 3px 8px; border-radius: 4px; margin-bottom: 10px; width: fit-content; }}
+        h1 {{ font-size: 26px; font-weight: 800; color: #fff; margin-bottom: 8px; }}
+        .meta-line {{ color: #94a3b8; font-size: 14px; margin-bottom: 14px; }}
+        .meta-line strong {{ color: #cbd5e1; }}
+        .synopsis {{ color: #94a3b8; font-size: 14px; line-height: 1.6; max-height: 140px; overflow-y: auto; background: #0b0f19; padding: 12px; border-radius: 8px; border: 1px solid #1f2937; }}
+        .section-title {{ font-size: 20px; font-weight: 700; margin-bottom: 18px; color: #fff; }}
+        .ep-list {{ display: flex; flex-direction: column; gap: 12px; }}
+        .ep-row {{
+            background: #111827; border-radius: 10px; padding: 16px 20px; border: 1px solid #1f2937;
+            display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;
+        }}
+        .ep-label {{ font-size: 16px; font-weight: 700; color: #38bdf8; }}
+        .ep-qualities {{ display: flex; gap: 10px; flex-wrap: wrap; }}
+        .ep-quality-pill {{
+            display: flex; align-items: center; gap: 6px; background: #1e293b; padding: 4px 8px;
+            border-radius: 8px; border: 1px solid #334155;
+        }}
+        .q-tag {{ font-size: 12px; font-weight: 700; color: #e2e8f0; }}
+        .ep-btn {{
+            background: #2563eb; color: #fff; text-decoration: none; padding: 4px 8px;
+            border-radius: 4px; font-size: 11px; font-weight: 600;
+        }}
+        .ep-btn-dl {{ background: #334155; }}
+        .ep-btn:hover {{ opacity: 0.9; }}
+        footer {{ text-align: center; padding: 40px 20px; color: #64748b; font-size: 13px; }}
+    </style>
+</head>
+<body>
+    <header class="navbar">
+        <a href="/"><img src="/logo.svg" alt="NimeBot Logo" class="logo-img"></a>
+        <a href="/" class="nav-btn">🏠 Beranda Portal</a>
+    </header>
+
+    <div class="container">
+        <div class="anime-header">
+            <img src="{cover_url}" alt="{title}" class="poster" onerror="this.src='/icon.svg'">
+            <div class="header-content">
+                <span class="badge-type">{atype} • {status}</span>
+                <h1>{title}</h1>
+                <p class="meta-line">📅 Tahun: <strong>{year}</strong> • 🏢 Studio: <strong>{studio}</strong> • 🏷️ <strong>{genres}</strong></p>
+                <div class="synopsis">{synopsis}</div>
+            </div>
+        </div>
+
+        <h2 class="section-title">📺 Daftar Episode Tersedia ({detail['available_episodes_count']})</h2>
+        <div class="ep-list">
+            {eps_html}
+        </div>
+    </div>
+
+    <footer>
+        &copy; 2026 NimeBot Auto • Running on Railway
     </footer>
 </body>
 </html>"""
@@ -660,14 +1225,21 @@ def create_web_app(tg_client: TelegramClient) -> web.Application:
         ep_idx = record["ep_index"] if record else 1
         quality = record["quality"] if record else "720p"
 
-        # Try to get Telegram file size
+        # Try to find anime detail to get cover and slug
+        anime_info = get_anime_detail(title)
+        cover_url = anime_info["cover_url"] if anime_info else "/icon.svg"
+        slug = anime_info["slug"] if anime_info else ""
+
         file_size_str = "Video MP4"
-        try:
-            msg = await tg_client.get_messages(LOG_CHANNEL, ids=msg_id)
-            if msg and msg.media and hasattr(msg.media, "document"):
-                file_size_str = human_bytes(msg.media.document.size)
-        except Exception:
-            pass
+        if record and record.get("file_size"):
+            file_size_str = f"{record['file_size'] / (1024*1024):.1f} MB"
+        else:
+            try:
+                msg = await tg_client.get_messages(LOG_CHANNEL, ids=msg_id)
+                if msg and msg.media and hasattr(msg.media, "document"):
+                    file_size_str = human_bytes(msg.media.document.size)
+            except Exception:
+                pass
 
         tg_chat_link = f"https://t.me/c/{abs(LOG_CHANNEL) - 1000000000000}/{msg_id}" if LOG_CHANNEL != 0 else "#"
 
@@ -676,34 +1248,35 @@ def create_web_app(tg_client: TelegramClient) -> web.Application:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
     <title>{title} - Episode {ep_idx} ({quality}) | NimeBot Auto</title>
     <style>
         * {{ box-sizing: border-box; margin: 0; padding: 0; }}
         body {{
-            background: #0f172a; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #090d16; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             display: flex; flex-direction: column; align-items: center; min-height: 100vh; padding: 20px 10px;
         }}
         .container {{
-            width: 100%; max-width: 900px; background: #1e293b; border-radius: 12px;
-            overflow: hidden; box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+            width: 100%; max-width: 960px; background: #111827; border-radius: 16px;
+            overflow: hidden; box-shadow: 0 10px 30px -5px rgba(0, 0, 0, 0.7); border: 1px solid #1f2937;
         }}
         .player-wrapper {{
             position: relative; background: #000; width: 100%; aspect-ratio: 16 / 9;
         }}
         video {{ width: 100%; height: 100%; display: block; }}
-        .info {{ padding: 20px; }}
+        .info {{ padding: 24px; }}
         .badge {{
-            display: inline-block; background: #3b82f6; color: white; font-size: 12px;
-            font-weight: 700; padding: 4px 8px; border-radius: 6px; margin-bottom: 8px;
+            display: inline-block; background: #38bdf8; color: #0f172a; font-size: 12px;
+            font-weight: 800; padding: 4px 10px; border-radius: 6px; margin-bottom: 10px;
         }}
-        h1 {{ font-size: 20px; font-weight: 700; margin-bottom: 12px; color: #fff; }}
+        h1 {{ font-size: 22px; font-weight: 800; margin-bottom: 8px; color: #fff; }}
         .meta {{ color: #94a3b8; font-size: 14px; margin-bottom: 20px; }}
         .actions {{ display: flex; gap: 10px; flex-wrap: wrap; }}
         .btn {{
             display: inline-flex; align-items: center; gap: 6px; background: #2563eb; color: white;
             text-decoration: none; padding: 10px 18px; border-radius: 8px; font-size: 14px; font-weight: 600;
         }}
-        .btn-sec {{ background: #334155; }}
+        .btn-sec {{ background: #1e293b; color: #38bdf8; border: 1px solid #334155; }}
         .btn:hover {{ opacity: 0.9; }}
         footer {{ margin-top: 30px; color: #64748b; font-size: 13px; text-align: center; }}
     </style>
@@ -711,7 +1284,7 @@ def create_web_app(tg_client: TelegramClient) -> web.Application:
 <body>
     <div class="container">
         <div class="player-wrapper">
-            <video controls autoplay playsinline preload="metadata">
+            <video controls autoplay playsinline preload="metadata" poster="{cover_url}">
                 <source src="/stream/{msg_id}" type="video/mp4">
                 Browser Anda tidak mendukung pemutar video HTML5.
             </video>
@@ -722,6 +1295,7 @@ def create_web_app(tg_client: TelegramClient) -> web.Application:
             <p class="meta">Ukuran file: <strong>{file_size_str}</strong> • Disiarkan otomatis via NimeBot Auto</p>
             <div class="actions">
                 <a href="/download/{msg_id}" class="btn">📥 Direct Download ({file_size_str})</a>
+                {f'<a href="/anime/{slug}" class="btn btn-sec">📺 Semua Episode Anime</a>' if slug else ''}
                 <a href="{tg_chat_link}" class="btn btn-sec">💬 Buka di Telegram</a>
                 <a href="/" class="btn btn-sec">🏠 Beranda Portal</a>
             </div>
@@ -740,10 +1314,29 @@ def create_web_app(tg_client: TelegramClient) -> web.Application:
     async def handle_download(request: web.Request) -> web.StreamResponse:
         return await stream_telegram_file(request, tg_client, is_download=True)
 
+    # Register Web UI & Player Routes
     app.router.add_get("/", handle_index)
+    app.router.add_get("/anime/{slug}", handle_anime_page)
     app.router.add_get("/watch/{msg_id}", handle_watch)
     app.router.add_get("/stream/{msg_id}", handle_stream)
     app.router.add_get("/download/{msg_id}", handle_download)
+
+    # Register Static Media Routes (Favicon, Logo, Icon, Anime Cover JPGs)
+    app.router.add_get("/favicon.ico", handle_favicon)
+    app.router.add_get("/favicon.svg", handle_favicon)
+    app.router.add_get("/logo.svg", handle_logo)
+    app.router.add_get("/icon.svg", handle_icon)
+    app.router.add_get("/cover/{msg_id}", handle_cover)
+    app.router.add_get("/cover/{msg_id}.jpg", handle_cover)
+    app.router.add_get("/api/cover/{msg_id}", handle_cover)
+
+    # Register REST API Routes
+    app.router.add_get("/api", handle_api_index)
+    app.router.add_get("/api/stats", handle_api_stats)
+    app.router.add_get("/api/anime", handle_api_anime)
+    app.router.add_get("/api/anime/{slug}", handle_api_anime_detail)
+    app.router.add_get("/api/episodes", handle_api_episodes)
+
     return app
 
 async def stream_telegram_file(request: web.Request, tg_client: TelegramClient, is_download: bool = False) -> web.StreamResponse:
@@ -831,6 +1424,145 @@ async def stream_telegram_file(request: web.Request, tg_client: TelegramClient, 
         except Exception as e:
             logging.debug(f"Stream interrupted: {e}")
         return response
+
+# ----------------- CHANNEL SCANNER & PARSER HELPERS -----------------
+def clean_title(title: str) -> str:
+    title = re.sub(r"^[┌│├└─\s🎬]+", "", title).strip()
+    title = re.sub(r"[─\s━│]+$", "", title).strip()
+    return title.strip()
+
+def parse_info_card(text: str, msg_id: int):
+    m_title = re.search(r"🎬\s*(.+?)(?:\n|─|━|$)", text)
+    title = clean_title(m_title.group(1)) if m_title else ""
+    if not title:
+        return None
+    m_type = re.search(r"Tipe\s*:\s*([^\n•]+)", text, re.I)
+    atype = m_type.group(1).strip() if m_type else "SERIES"
+    m_studio = re.search(r"Studio\s*:\s*([^\n•]+)", text, re.I)
+    studio = m_studio.group(1).strip() if m_studio else ""
+    m_year = re.search(r"Tahun\s*:\s*(\d{4})", text, re.I)
+    year = m_year.group(1).strip() if m_year else ""
+    m_genre = re.search(r"Genre\s*:\s*([^\n•]+)", text, re.I)
+    genre = m_genre.group(1).strip() if m_genre else ""
+    m_status = re.search(r"Status\s*:\s*([^\n•|]+)", text, re.I)
+    status = m_status.group(1).strip() if m_status else "FINISHED"
+    m_eps = re.search(r"Episode\s*:\s*(\d+)", text, re.I)
+    total_eps = int(m_eps.group(1)) if m_eps else 0
+    m_syn = re.search(r"SINOPSIS\s*:?\s*\n*(.+?)(?:\n\s*🍿|$)", text, re.DOTALL | re.I)
+    synopsis = m_syn.group(1).strip() if m_syn else ""
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", title.lower()).strip("-")
+    return {
+        "title": title,
+        "slug": slug,
+        "cover_msg_id": msg_id,
+        "type": atype,
+        "studio": studio,
+        "year": year,
+        "genres": genre,
+        "status": status,
+        "total_eps": total_eps,
+        "synopsis": synopsis
+    }
+
+def parse_video(msg):
+    doc = msg.media.document
+    text = msg.raw_text or ""
+    m_title = re.search(r"🎬\s*([^\n─━│]+)", text)
+    title = clean_title(m_title.group(1)) if m_title else ""
+    if not title:
+        return None
+    m_ep = re.search(r"(?:Episode|Ep)\s*:?\s*(?:Episode\s*)?(\d+)", text, re.I)
+    ep = int(m_ep.group(1)) if m_ep else 1
+    m_q = re.search(r"(360p|480p|720p|1080p)", text, re.I)
+    quality = m_q.group(1).lower() if m_q else "720p"
+    return {
+        "title": title,
+        "ep": ep,
+        "quality": quality,
+        "msg_id": msg.id,
+        "file_size": doc.size
+    }
+
+async def run_channel_sync(client: TelegramClient, chat_id: int, status_msg_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT value FROM scraper_config WHERE key = 'last_synced_id'")
+    row = c.fetchone()
+    last_id = int(row[0]) if row and row[0] else 1
+    conn.close()
+
+    try:
+        sample_ids = list(range(last_id, last_id + 500))
+        msgs = await client.get_messages(LOG_CHANNEL, ids=sample_ids)
+        valid_ids = [m.id for m in msgs if m is not None]
+        if not valid_ids:
+            sample_ids = list(range(max(1, last_id - 100), last_id + 100))
+            msgs = await client.get_messages(LOG_CHANNEL, ids=sample_ids)
+            valid_ids = [m.id for m in msgs if m is not None]
+        max_id = max(valid_ids) if valid_ids else last_id
+    except Exception:
+        max_id = last_id + 100
+
+    if max_id <= last_id and last_id > 1:
+        stats = get_api_stats()
+        await client.edit_message(
+            chat_id,
+            status_msg_id,
+            f"✅ **Database Channel Sudah Terkini!**\n\n"
+            f"🎬 Total Anime: `{stats['total_anime']}`\n"
+            f"📺 Total Episode: `{stats['total_episodes']}`\n"
+            f"💾 Video Storage: `{stats['total_storage_gb']} GB`\n\n"
+            f"Semua file dan cover media siap disajikan via REST API:\n`{STREAMER_URL}/api`"
+        )
+        return
+
+    start_scan = max(1, last_id - 50)
+    end_scan = max_id + 50
+
+    conn = sqlite3.connect(DB_PATH)
+    for chunk_start in range(start_scan, end_scan + 1, 50):
+        chunk_ids = list(range(chunk_start, min(chunk_start + 50, end_scan + 1)))
+        try:
+            msgs = await client.get_messages(LOG_CHANNEL, ids=chunk_ids)
+        except Exception:
+            continue
+
+        for m in msgs:
+            if not m:
+                continue
+            text = m.raw_text or ""
+            is_image = bool(m.photo or (m.media and hasattr(m.media, "document") and getattr(m.media.document, "mime_type", "").startswith("image/")))
+            if is_image and ("INFORMASI ANIME" in text or "SINOPSIS" in text or "Tipe:" in text or "Status:" in text):
+                info = parse_info_card(text, m.id)
+                if info:
+                    conn.execute("""
+                        INSERT OR REPLACE INTO anime_series (title, slug, cover_msg_id, anime_type, studio, year, genres, status, total_episodes, synopsis)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (info["title"], info["slug"], info["cover_msg_id"], info["type"], info["studio"], info["year"], info["genres"], info["status"], info["total_eps"], info["synopsis"]))
+            elif m.media and hasattr(m.media, "document") and getattr(m.media.document, "mime_type", "").startswith("video/"):
+                v = parse_video(m)
+                if v:
+                    conn.execute("""
+                        INSERT OR REPLACE INTO records (movie_id, ep_index, quality, msg_id, anime_title, file_size)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, ("", v["ep"], v["quality"], v["msg_id"], v["title"], v["file_size"]))
+        conn.commit()
+
+    conn.execute("INSERT OR REPLACE INTO scraper_config (key, value) VALUES ('last_synced_id', ?)", (str(end_scan),))
+    conn.commit()
+    conn.close()
+
+    stats = get_api_stats()
+    await client.edit_message(
+        chat_id,
+        status_msg_id,
+        f"✅ **Sinkronisasi Selesai!**\n\n"
+        f"🎬 **Total Anime Series:** `{stats['total_anime']}`\n"
+        f"📺 **Total Episode:** `{stats['total_episodes']}`\n"
+        f"💾 **Total Cloud Storage:** `{stats['total_storage_gb']} GB`\n\n"
+        f"🌐 **REST API & Cover Media Siap Diakses!**\n"
+        f"URL: `{STREAMER_URL}/api`"
+    )
 
 # ----------------- MAIN TELEGRAM APP & WEB RUNNER -----------------
 async def main():
@@ -969,6 +1701,33 @@ async def main():
             await client.send_message(event.chat_id, t, buttons=b)
             return
 
+        if text.startswith("/api"):
+            stats = get_api_stats()
+            api_msg = (
+                "🌐 **NimeBot Auto REST API & Media**\n"
+                "──────────────────────────────\n"
+                f"📊 **Total Anime:** `{stats['total_anime']}`\n"
+                f"📺 **Total Episode:** `{stats['total_episodes']}`\n"
+                f"💾 **Total Cloud Storage:** `{stats['total_storage_gb']} GB`\n"
+                "──────────────────────────────\n"
+                f"🔗 **Base API URL:** `{STREAMER_URL}/api`\n"
+                f"🎬 **Daftar Anime (JSON):** `{STREAMER_URL}/api/anime`\n"
+                f"📺 **Daftar Episode (JSON):** `{STREAMER_URL}/api/episodes`\n"
+                f"🖼️ **Media Cover (JPG):** `{STREAMER_URL}/cover/{{id}}.jpg`\n"
+                f"✨ **Brand Icon (SVG):** `{STREAMER_URL}/favicon.svg`"
+            )
+            buttons = [
+                [Button.url("🚀 Buka Portal Web", STREAMER_URL)],
+                [Button.url("📜 Dokumentasi API", f"{STREAMER_URL}/api")]
+            ]
+            await event.respond(api_msg, buttons=buttons)
+            return
+
+        if text.startswith("/sync"):
+            status_msg = await event.respond("🔄 **Memulai Sinkronisasi Channel Telegram...**\nMemeriksa episode dan cover anime terbaru...")
+            await run_channel_sync(client, event.chat_id, status_msg.id)
+            return
+
     @client.on(events.CallbackQuery)
     async def on_callback(event):
         global CURRENT_MODE, IS_RUNNING, ACTIVE_TASK
@@ -991,6 +1750,30 @@ async def main():
         if data == "btn_menu":
             t, b = build_menu(CURRENT_MODE, IS_RUNNING)
             await client.edit_message(chat_id, msg_id, text=t, buttons=b)
+        elif data == "btn_sync_channel":
+            status_msg = await event.respond("🔄 **Memulai Sinkronisasi Channel Telegram...**\nMemeriksa episode dan cover anime terbaru...")
+            await run_channel_sync(client, chat_id, status_msg.id)
+        elif data == "btn_api_info":
+            stats = get_api_stats()
+            api_msg = (
+                "🌐 **NimeBot Auto REST API & Media**\n"
+                "──────────────────────────────\n"
+                f"📊 **Total Anime:** `{stats['total_anime']}`\n"
+                f"📺 **Total Episode:** `{stats['total_episodes']}`\n"
+                f"💾 **Total Cloud Storage:** `{stats['total_storage_gb']} GB`\n"
+                "──────────────────────────────\n"
+                f"🔗 **Base API URL:** `{STREAMER_URL}/api`\n"
+                f"🎬 **Daftar Anime (JSON):** `{STREAMER_URL}/api/anime`\n"
+                f"📺 **Daftar Episode (JSON):** `{STREAMER_URL}/api/episodes`\n"
+                f"🖼️ **Media Cover (JPG):** `{STREAMER_URL}/cover/{{id}}.jpg`\n"
+                f"✨ **Brand Icon (SVG):** `{STREAMER_URL}/favicon.svg`"
+            )
+            buttons = [
+                [Button.url("🚀 Buka Portal Web", STREAMER_URL)],
+                [Button.url("📜 Dokumentasi API", f"{STREAMER_URL}/api")],
+                [Button.inline("🔙 Kembali ke Menu", b"btn_menu")]
+            ]
+            await client.edit_message(chat_id, msg_id, text=api_msg, buttons=buttons)
         elif data == "btn_toggle_mode":
             CURRENT_MODE = "manual" if CURRENT_MODE == "auto" else "auto"
             t, b = build_menu(CURRENT_MODE, IS_RUNNING)
