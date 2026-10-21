@@ -101,9 +101,16 @@ def get_episode_streams(ep_id: Union[int, str]) -> List[Dict[str, Any]]:
         if isinstance(data, dict):
             inner = data.get("data", {})
             if isinstance(inner, dict):
-                streams = inner.get("stream", [])
+                streams = inner.get("server") or inner.get("stream") or []
                 if isinstance(streams, list):
-                    return streams
+                    formatted = []
+                    for s in streams:
+                        url = s.get("link") or s.get("url")
+                        if url:
+                            item = dict(s)
+                            item["url"] = url
+                            formatted.append(item)
+                    return formatted
         return []
     except Exception as e:
         print(f"Error fetching episode {ep_id} streams: {e}")
