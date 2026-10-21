@@ -2,7 +2,7 @@ import os
 import json
 from typing import Optional
 
-DEFAULT_CONFIG_PATH = "config.json"
+DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
 
 class Config:
     def __init__(self, path: str = DEFAULT_CONFIG_PATH):

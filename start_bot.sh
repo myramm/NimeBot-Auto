@@ -13,11 +13,12 @@ if [ -n "$PID" ]; then
 fi
 
 echo "Starting Master Bot daemon..."
-nohup python3 -u /root/src/master_bot.py > /root/master_bot.log 2>&1 &
-NEW_PID=$!
+nohup python3 -u /root/src/master_bot.py </dev/null > /root/master_bot.log 2>&1 &
+disown
 sleep 2
 
-if ps -p $NEW_PID > /dev/null; then
+NEW_PID=$(pgrep -f "src/master_bot.py" || true)
+if [ -n "$NEW_PID" ]; then
     MEM=$(ps -o rss= -p $NEW_PID | awk '{print int($1/1024) " MB"}')
     echo "✅ Master Bot started successfully! PID: $NEW_PID (Memory: $MEM)"
 else

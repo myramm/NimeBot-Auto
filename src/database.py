@@ -2,7 +2,7 @@ import os
 import sqlite3
 from typing import Union, List, Dict, Any
 
-DEFAULT_DB_PATH = "anime_db.sqlite"
+DEFAULT_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "anime_db.sqlite")
 
 def get_connection(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     parent = os.path.dirname(db_path)
