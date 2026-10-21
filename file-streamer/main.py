@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import time
 import json
@@ -55,6 +56,12 @@ def init_db():
             PRIMARY KEY(movie_id, ep_index, quality)
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scraper_config (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
     conn.commit()
 
     # Pre-seed Macross F and Yami Shibai 15 if empty
@@ -93,11 +100,54 @@ def record_upload(movie_id: str, ep_index: int, quality: str, msg_id: int, title
     conn.commit()
     conn.close()
 
-# ----------------- ANIMEIN API -----------------
+# ----------------- CONFIGURABLE SCRAPER SETTINGS -----------------
+def get_scraper_config(key: str, default: str) -> str:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT value FROM scraper_config WHERE key = ?", (key,))
+        row = c.fetchone()
+        conn.close()
+        if row and row[0]:
+            return row[0]
+    except Exception:
+        pass
+    env_val = os.environ.get(f"SCRAPER_{key.upper()}")
+    return env_val if env_val else default
+
+def set_scraper_config(key: str, value: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("INSERT OR REPLACE INTO scraper_config (key, value) VALUES (?, ?)", (key, str(value).strip()))
+    conn.commit()
+    conn.close()
+    global _catalog_cache
+    _catalog_cache = (0.0, [])  # invalidate cache when scraper config changes
+
+def reset_scraper_config():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM scraper_config")
+    conn.commit()
+    conn.close()
+    global _catalog_cache
+    _catalog_cache = (0.0, [])
+
+# ----------------- DYNAMIC ANIMEIN API SCRAPER -----------------
 _catalog_cache = (0.0, [])
+
 def api_get(endpoint: str, timeout: int = 15) -> Dict[str, Any]:
-    url = f"https://xyz-api.animein.net/{endpoint.lstrip('/')}"
-    req = urllib.request.Request(url, headers={"User-Agent": "okhttp/4.12.0", "apk_ver": "5.2.2"})
+    base_url = get_scraper_config("base_url", "https://xyz-api.animein.net").rstrip("/")
+    ua = get_scraper_config("user_agent", "okhttp/4.12.0")
+    apk_ver = get_scraper_config("apk_ver", "5.2.2")
+
+    # Interpolate or update apk_ver if dynamic
+    if "apk_ver=" in endpoint:
+        endpoint = re.sub(r"apk_ver=[^&]+", f"apk_ver={apk_ver}", endpoint)
+    else:
+        sep = "&" if "?" in endpoint else "?"
+        endpoint = f"{endpoint}{sep}apk_ver={apk_ver}"
+
+    url = f"{base_url}/{endpoint.lstrip('/')}"
+    req = urllib.request.Request(url, headers={"User-Agent": ua, "apk_ver": apk_ver})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -107,7 +157,7 @@ def get_latest_catalog() -> List[Dict[str, Any]]:
     if _catalog_cache[1] and (now - _catalog_cache[0]) < 120:
         return _catalog_cache[1]
     try:
-        data = api_get("3/2/home/new?id_user=0&key_client=guest&apk_ver=5.2.2")
+        data = api_get("3/2/home/new?id_user=0&key_client=guest")
         movies = data.get("data", {}).get("movie", [])
         if movies:
             _catalog_cache = (now, movies)
@@ -118,7 +168,7 @@ def get_latest_catalog() -> List[Dict[str, Any]]:
 
 def get_movie_details(movie_id: str) -> Optional[Dict[str, Any]]:
     try:
-        data = api_get(f"3/2/movie/detail/{movie_id}?id_user=0&key_client=guest&apk_ver=5.2.2")
+        data = api_get(f"3/2/movie/detail/{movie_id}?id_user=0&key_client=guest")
         return data.get("data", {}).get("movie")
     except Exception as e:
         logging.error(f"Error details {movie_id}: {e}")
@@ -126,7 +176,7 @@ def get_movie_details(movie_id: str) -> Optional[Dict[str, Any]]:
 
 def get_movie_episodes(movie_id: str) -> List[Dict[str, Any]]:
     try:
-        data = api_get(f"3/2/movie/episode/{movie_id}?id_user=0&key_client=guest&apk_ver=5.2.2")
+        data = api_get(f"3/2/movie/episode/{movie_id}?id_user=0&key_client=guest")
         eps = data.get("data", {}).get("episode", [])
         formatted = []
         for ep in eps:
@@ -143,7 +193,7 @@ def get_movie_episodes(movie_id: str) -> List[Dict[str, Any]]:
 
 def get_episode_streams(ep_id: str) -> List[Dict[str, Any]]:
     try:
-        data = api_get(f"3/2/episode/streamnew/{ep_id}?id_user=0&key_client=guest&apk_ver=5.2.2")
+        data = api_get(f"3/2/episode/streamnew/{ep_id}?id_user=0&key_client=guest")
         inner = data.get("data", {})
         servers = inner.get("server") or inner.get("stream") or []
         formatted = []
@@ -204,23 +254,51 @@ async def notify_progress(client: TelegramClient, chat_id: int, msg_id: int, tit
 # ----------------- KEYBOARD BUILDERS -----------------
 def build_menu(mode: str, is_running: bool) -> Tuple[str, List[List[Button]]]:
     status_str = "🟢 RUNNING (Railway)" if is_running else "🔴 STOPPED"
+    base = get_scraper_config("base_url", "https://xyz-api.animein.net")
+    q_filter = get_scraper_config("quality_filter", "ALL")
     text = (
-        "🤖 **ReNime Anime Auto-Uploader (Railway Cloud)**\n"
+        "🤖 **NimeBot Auto (Railway Cloud)**\n"
         "──────────────────────────────\n"
         f"⚡ **Status:** `{status_str}`\n"
         f"🔄 **Mode:** `{mode.upper()}`\n"
         f"☁️ **Railway Account:** `{CURRENT_EMAIL}`\n"
+        f"🌐 **Scraper Source:** `{base}`\n"
+        f"🎯 **Target Quality:** `{q_filter}`\n"
         "──────────────────────────────\n"
         "Semua kontrol dapat diakses lewat tombol di bawah 👇"
     )
     start_btn = Button.inline("⏹ Stop Worker", b"btn_stop") if is_running else Button.inline("▶️ Start Auto Update", b"btn_start_auto")
     mode_text = "🔄 Mode: [MANUAL] ➔ AUTO" if mode == "manual" else "🔄 Mode: [AUTO] ➔ MANUAL"
-    
+
     buttons = [
         [start_btn],
         [Button.inline(mode_text, b"btn_toggle_mode"), Button.inline("🎬 Katalog Anime", b"btn_cat_0")],
-        [Button.inline("📊 Status & Info", b"btn_status"), Button.inline("🔑 Ganti Token Railway", b"btn_token_info")],
-        [Button.inline("🔄 Refresh Menu", b"btn_menu"), Button.url("🌐 Web Streamer", STREAMER_URL)]
+        [Button.inline("⚙️ Konfigurasi Scraper", b"btn_scraper_menu"), Button.inline("🔑 Ganti Token Railway", b"btn_token_info")],
+        [Button.inline("📊 Status & Info", b"btn_status"), Button.inline("🔄 Refresh Menu", b"btn_menu")],
+        [Button.url("🌐 Web Streamer", STREAMER_URL)]
+    ]
+    return text, buttons
+
+def build_scraper_menu() -> Tuple[str, List[List[Button]]]:
+    base = get_scraper_config("base_url", "https://xyz-api.animein.net")
+    ua = get_scraper_config("user_agent", "okhttp/4.12.0")
+    apk_ver = get_scraper_config("apk_ver", "5.2.2")
+    q_filter = get_scraper_config("quality_filter", "ALL")
+
+    text = (
+        "⚙️ **Pengaturan Scraper (NimeBot Auto)**\n"
+        "──────────────────────────────\n"
+        f"🌐 **Base URL:** `{base}`\n"
+        f"📱 **User-Agent:** `{ua}`\n"
+        f"🔢 **APK Version:** `{apk_ver}`\n"
+        f"🎯 **Filter Kualitas:** `{q_filter}`\n"
+        "──────────────────────────────\n"
+        "Pilih pengaturan yang ingin Anda ubah secara live:"
+    )
+    buttons = [
+        [Button.inline("🌐 Ubah Base URL", b"cfg_base_url"), Button.inline("🔢 Ubah APK Ver", b"cfg_apk_ver")],
+        [Button.inline("📱 Ubah User-Agent", b"cfg_ua"), Button.inline(f"🎯 Kualitas: [{q_filter}]", b"cfg_toggle_q")],
+        [Button.inline("🔄 Reset ke Default", b"cfg_reset"), Button.inline("🔙 Kembali ke Menu", b"btn_menu")]
     ]
     return text, buttons
 
@@ -326,7 +404,9 @@ async def run_transfer_pipeline(client: TelegramClient, chat_id: int, prog_msg_i
             for attempt in range(1, 4):
                 try:
                     await notify_progress(client, chat_id, prog_msg_id, title, ep_idx, q, f"Downloading (Attempt {attempt})", 0, 100, 0, force=True)
-                    req = urllib.request.Request(s_url, headers={"User-Agent": "okhttp/4.12.0", "Referer": "https://xyz-api.animein.net"})
+                    ua = get_scraper_config("user_agent", "okhttp/4.12.0")
+                    base = get_scraper_config("base_url", "https://xyz-api.animein.net")
+                    req = urllib.request.Request(s_url, headers={"User-Agent": ua, "Referer": base})
                     with urllib.request.urlopen(req, timeout=30) as resp, open(filename, "wb") as f:
                         total_len = int(resp.headers.get("content-length", 0))
                         dl_len = 0
@@ -362,7 +442,7 @@ async def run_transfer_pipeline(client: TelegramClient, chat_id: int, prog_msg_i
                 el = max(0.001, time.time() - t_up)
                 await notify_progress(client, chat_id, prog_msg_id, title, ep_idx, q, "Uploading to Telegram", sent, total, sent / el)
 
-            caption = f"🎬 **{title} - Episode {ep_idx} ({q})**\n\n🍿 Disiarkan otomatis via ReNime Railway Bot"
+            caption = f"🎬 **{title} - Episode {ep_idx} ({q})**\n\n🍿 Disiarkan otomatis via NimeBot Auto"
             sent_msg = await client.send_file(
                 LOG_CHANNEL,
                 filename,
@@ -398,7 +478,7 @@ async def run_transfer_pipeline(client: TelegramClient, chat_id: int, prog_msg_i
 # ----------------- MAIN TELEGRAM APP -----------------
 async def main():
     init_db()
-    logging.info("Starting ReNime Master Bot on Railway container...")
+    logging.info("Starting NimeBot Auto on Railway container...")
     client = TelegramClient("railway_session", API_ID, API_HASH)
     await client.start(bot_token=BOT_TOKEN)
     logging.info("Telegram Bot Client connected and authorized successfully!")
@@ -446,11 +526,42 @@ async def main():
             await client.send_message(event.chat_id, t, buttons=b)
             return
 
+        # Scraper Config Updates via Text Input
+        if state and state.get("action") == "set_base_url":
+            new_url = text.rstrip("/")
+            if not (new_url.startswith("http://") or new_url.startswith("https://")):
+                await event.respond("❌ **URL tidak valid!** Harap awali dengan `https://` atau `http://`.")
+                return
+            set_scraper_config("base_url", new_url)
+            USER_STATES.pop(user_id, None)
+            await event.respond(f"✅ **Base URL Scraper berhasil diubah menjadi:**\n`{new_url}`")
+            t, b = build_scraper_menu()
+            await client.send_message(event.chat_id, t, buttons=b)
+            return
+
+        if state and state.get("action") == "set_apk_ver":
+            new_ver = text.strip()
+            set_scraper_config("apk_ver", new_ver)
+            USER_STATES.pop(user_id, None)
+            await event.respond(f"✅ **APK Version Scraper berhasil diubah menjadi:** `{new_ver}`")
+            t, b = build_scraper_menu()
+            await client.send_message(event.chat_id, t, buttons=b)
+            return
+
+        if state and state.get("action") == "set_ua":
+            new_ua = text.strip()
+            set_scraper_config("user_agent", new_ua)
+            USER_STATES.pop(user_id, None)
+            await event.respond(f"✅ **User-Agent Scraper berhasil diubah menjadi:** `{new_ua}`")
+            t, b = build_scraper_menu()
+            await client.send_message(event.chat_id, t, buttons=b)
+            return
+
         if text.startswith("/start"):
             if not CURRENT_EMAIL:
                 USER_STATES[user_id] = {"action": "require_token_to_start"}
                 prompt_text = (
-                    "👋 **Selamat datang di ReNime Anime Auto-Uploader!**\n"
+                    "👋 **Selamat datang di NimeBot Auto!**\n"
                     "──────────────────────────────\n"
                     "⚠️ **Railway Token Diperlukan**\n"
                     "Untuk memulai bot dan menghubungkan worker cloud Railway, silakan **paste Railway API Token** Anda langsung ke chat ini:"
@@ -459,6 +570,11 @@ async def main():
                 return
 
             t, b = build_menu(CURRENT_MODE, IS_RUNNING)
+            await client.send_message(event.chat_id, t, buttons=b)
+            return
+
+        if text.startswith("/scraper"):
+            t, b = build_scraper_menu()
             await client.send_message(event.chat_id, t, buttons=b)
             return
 
@@ -511,6 +627,51 @@ async def main():
         elif data == "btn_status":
             t, b = build_menu(CURRENT_MODE, IS_RUNNING)
             await client.edit_message(chat_id, msg_id, text=t, buttons=b)
+        elif data == "btn_scraper_menu":
+            t, b = build_scraper_menu()
+            await client.edit_message(chat_id, msg_id, text=t, buttons=b)
+        elif data == "cfg_base_url":
+            USER_STATES[user_id] = {"action": "set_base_url"}
+            text = (
+                "🌐 **Ubah Base URL Scraper**\n"
+                "──────────────────────────────\n"
+                f"Saat ini: `{get_scraper_config('base_url', 'https://xyz-api.animein.net')}`\n\n"
+                "Silakan kirim URL API baru Anda langsung ke chat ini\n*(Contoh: `https://xyz-api.animein.net` atau link mirror)*:"
+            )
+            buttons = [[Button.inline("🔙 Batal", b"btn_scraper_menu")]]
+            await client.edit_message(chat_id, msg_id, text=text, buttons=buttons)
+        elif data == "cfg_apk_ver":
+            USER_STATES[user_id] = {"action": "set_apk_ver"}
+            text = (
+                "🔢 **Ubah APK Version Scraper**\n"
+                "──────────────────────────────\n"
+                f"Saat ini: `{get_scraper_config('apk_ver', '5.2.2')}`\n\n"
+                "Silakan kirim versi APK baru (misal: `5.2.2` atau `5.3.0`):"
+            )
+            buttons = [[Button.inline("🔙 Batal", b"btn_scraper_menu")]]
+            await client.edit_message(chat_id, msg_id, text=text, buttons=buttons)
+        elif data == "cfg_ua":
+            USER_STATES[user_id] = {"action": "set_ua"}
+            text = (
+                "📱 **Ubah User-Agent Scraper**\n"
+                "──────────────────────────────\n"
+                f"Saat ini: `{get_scraper_config('user_agent', 'okhttp/4.12.0')}`\n\n"
+                "Silakan kirim User-Agent baru:"
+            )
+            buttons = [[Button.inline("🔙 Batal", b"btn_scraper_menu")]]
+            await client.edit_message(chat_id, msg_id, text=text, buttons=buttons)
+        elif data == "cfg_toggle_q":
+            curr_q = get_scraper_config("quality_filter", "ALL")
+            cycle = {"ALL": "720p", "720p": "1080p", "1080p": "480p", "480p": "ALL"}
+            next_q = cycle.get(curr_q, "ALL")
+            set_scraper_config("quality_filter", next_q)
+            t, b = build_scraper_menu()
+            await client.edit_message(chat_id, msg_id, text=t, buttons=b)
+        elif data == "cfg_reset":
+            reset_scraper_config()
+            await event.answer("✅ Pengaturan scraper dikembalikan ke default!", alert=True)
+            t, b = build_scraper_menu()
+            await client.edit_message(chat_id, msg_id, text=t, buttons=b)
         elif data.startswith("btn_cat_"):
             page = int(data.split("_")[-1])
             t, b = build_catalog(page)
@@ -555,6 +716,8 @@ async def main():
             # Scan top 6 newest anime in catalog
             items_to_scan = cat[:6]
             logging.info(f"Auto-scan checking {len(items_to_scan)} anime...")
+            q_filter = get_scraper_config("quality_filter", "ALL")
+
             for idx, m in enumerate(items_to_scan, 1):
                 m_id = str(m.get("id"))
                 title = m.get("title", f"Anime {m_id}")
@@ -573,13 +736,20 @@ async def main():
                 for ep in eps[:3]:
                     ep_id = str(ep.get("id"))
                     ep_idx = int(ep.get("index", 0))
-                    # Pre-check if 720p and 1080p are already uploaded
-                    if has_uploaded(m_id, ep_idx, "720p") and has_uploaded(m_id, ep_idx, "1080p"):
-                        continue
+                    # Pre-check if standard qualities are already uploaded
+                    if q_filter == "ALL":
+                        if has_uploaded(m_id, ep_idx, "720p") and has_uploaded(m_id, ep_idx, "1080p"):
+                            continue
+                    else:
+                        if has_uploaded(m_id, ep_idx, q_filter):
+                            continue
+
                     streams = await asyncio.to_thread(get_episode_streams, ep_id)
                     for s in streams:
                         q = s.get("quality", "720p")
                         url = s.get("url")
+                        if q_filter != "ALL" and q != q_filter:
+                            continue
                         if url and not has_uploaded(m_id, ep_idx, q):
                             pending.append({
                                 "movie_id": m_id,
@@ -616,6 +786,7 @@ async def main():
             det = await asyncio.to_thread(get_movie_details, movie_id)
             title = det.get("title", f"Anime {movie_id}") if det else f"Anime {movie_id}"
             eps = await asyncio.to_thread(get_movie_episodes, movie_id)
+            q_filter = get_scraper_config("quality_filter", "ALL")
             pending = []
             for idx, ep in enumerate(eps, 1):
                 ep_id = str(ep.get("id"))
@@ -634,6 +805,8 @@ async def main():
                 for s in streams:
                     q = s.get("quality", "720p")
                     url = s.get("url")
+                    if q_filter != "ALL" and q != q_filter:
+                        continue
                     if url and not has_uploaded(movie_id, ep_idx, q):
                         pending.append({
                             "movie_id": movie_id,
@@ -670,10 +843,13 @@ async def main():
             det = await asyncio.to_thread(get_movie_details, movie_id)
             title = det.get("title", f"Anime {movie_id}") if det else f"Anime {movie_id}"
             streams = await asyncio.to_thread(get_episode_streams, ep_id)
+            q_filter = get_scraper_config("quality_filter", "ALL")
             pending = []
             for s in streams:
                 q = s.get("quality", "720p")
                 url = s.get("url")
+                if q_filter != "ALL" and q != q_filter:
+                    continue
                 if url and not has_uploaded(movie_id, ep_idx, q):
                     pending.append({
                         "movie_id": movie_id,
@@ -700,7 +876,7 @@ async def main():
         )
         ACTIVE_TASK = asyncio.create_task(run_transfer_pipeline(client, chat_id, status_msg.id, pending))
 
-    logging.info("Bot is ready and listening for events on Railway!")
+    logging.info("NimeBot Auto is ready and listening for events on Railway!")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
