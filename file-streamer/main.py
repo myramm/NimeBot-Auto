@@ -20,6 +20,7 @@ socket.getaddrinfo = _getaddrinfo_ipv4
 
 from telethon import TelegramClient, events, Button
 from telethon.tl.types import DocumentAttributeVideo
+from telethon.errors import MessageNotModifiedError
 from aiohttp import web
 
 logging.basicConfig(
@@ -36,12 +37,22 @@ LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL", "0") or "0")
 STREAMER_URL = os.environ.get("STREAMER_URL", "https://uploader-production-26af.up.railway.app").rstrip("/")
 DB_PATH = os.environ.get("DB_PATH", "/app/anime_db.sqlite" if os.path.exists("/app") else "anime_db.sqlite")
 
-ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "6164710787"))  # Owner / Admin
+ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID", "6164710787").strip()  # Owner / Admin ID(s)
 CURRENT_MODE = "auto"
 CURRENT_EMAIL = "bexdofjohn@gmail.com"
 IS_RUNNING = False
 ACTIVE_TASK: Optional[asyncio.Task] = None
 USER_STATES: Dict[int, Dict[str, Any]] = {}
+
+def is_authorized(user_id: int) -> bool:
+    """Check if user_id is authorized. Returns True if ADMIN_USER_ID is 0/empty or user_id matches."""
+    admin_val = os.environ.get("ADMIN_USER_ID", ADMIN_USER_ID).strip()
+    if not admin_val or admin_val == "0":
+        return True
+    allowed_ids = {int(x.strip()) for x in admin_val.split(",") if x.strip().lstrip("-").isdigit()}
+    if not allowed_ids:
+        return True
+    return user_id in allowed_ids
 
 # ----------------- DATABASE -----------------
 def init_db():
@@ -829,6 +840,15 @@ async def main():
     await client.start(bot_token=BOT_TOKEN)
     logging.info("Telegram Bot Client connected and authorized successfully!")
 
+    # Safe edit message wrapper to ignore MessageNotModifiedError
+    _orig_edit = client.edit_message
+    async def safe_edit(*args, **kwargs):
+        try:
+            return await _orig_edit(*args, **kwargs)
+        except MessageNotModifiedError:
+            return None
+    client.edit_message = safe_edit
+
     # Setup & Launch Integrated aiohttp Web Streamer
     app = create_web_app(client)
     runner = web.AppRunner(app)
@@ -848,8 +868,12 @@ async def main():
         text = event.raw_text.strip()
         state = USER_STATES.get(user_id)
 
-        if ADMIN_USER_ID and user_id != ADMIN_USER_ID:
-            await event.respond("⛔ **Akses Terbatas:** Anda bukan pemilik bot ini.")
+        if not is_authorized(user_id):
+            await event.respond(
+                f"⛔ **Akses Terbatas:** Anda bukan pemilik bot ini.\n\n"
+                f"🆔 **ID Telegram Anda:** `{user_id}`\n\n"
+                f"ℹ️ *Jika Anda adalah pemilik bot, tambahkan ID di atas ke variabel `ADMIN_USER_ID` di Railway (bisa dipisah koma untuk banyak ID), atau ubah `ADMIN_USER_ID=0` untuk mengizinkan semua pengguna.*"
+            )
             return
 
         if state and state.get("action") == "require_token_to_start":
@@ -955,8 +979,8 @@ async def main():
 
         logging.info(f"Callback query from user {user_id}: {data}")
 
-        if ADMIN_USER_ID and user_id != ADMIN_USER_ID:
-            await event.answer("⛔ Akses ditolak", alert=True)
+        if not is_authorized(user_id):
+            await event.answer(f"⛔ Akses ditolak (ID Anda: {user_id})", alert=True)
             return
 
         try:
