@@ -28,10 +28,10 @@ logging.basicConfig(
 )
 
 # ----------------- CONFIG & ENV -----------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-API_ID = int(os.environ.get("API_ID", "37124183"))
-API_HASH = os.environ.get("API_HASH", "f4d846728e694c2d1071ca7d3b2f6c81")
-LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL", "-1004462080662"))
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+API_ID = int(os.environ.get("API_ID", "0") or "0")
+API_HASH = os.environ.get("API_HASH", "")
+LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL", "0") or "0")
 STREAMER_URL = os.environ.get("STREAMER_URL", "https://streamer-production-c24a.up.railway.app").rstrip("/")
 DB_PATH = os.environ.get("DB_PATH", "/app/anime_db.sqlite" if os.path.exists("/app") else "anime_db.sqlite")
 

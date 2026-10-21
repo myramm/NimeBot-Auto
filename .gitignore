@@ -1,5 +1,6 @@
 .*
 !.gitignore
+!.env.example
 !.superpowers
 __pycache__/
 *.pyc
