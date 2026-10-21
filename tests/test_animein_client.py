@@ -1,7 +1,19 @@
 from unittest.mock import patch
 import urllib.error
 import pytest
-from src.animein_client import get_latest_catalog, get_movie_details, get_movie_episodes, get_episode_streams
+from src.animein_client import (
+    get_latest_catalog,
+    get_movie_details,
+    get_movie_episodes,
+    get_episode_streams,
+    clear_cache
+)
+
+@pytest.fixture(autouse=True)
+def reset_cache():
+    clear_cache()
+    yield
+    clear_cache()
 
 def test_get_movie_episodes_parses_list():
     mock_response = {

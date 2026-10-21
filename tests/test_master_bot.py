@@ -3,7 +3,15 @@ import json
 import pytest
 from unittest.mock import patch, MagicMock
 from src.config import Config
-from src.master_bot import parse_command, format_menu_text, build_menu_keyboard, MasterBot
+from src.master_bot import (
+    parse_command,
+    format_menu_text,
+    build_menu_keyboard,
+    build_catalog_keyboard,
+    build_anime_detail_keyboard,
+    build_episodes_keyboard,
+    MasterBot
+)
 
 TEST_CONFIG_PATH = "tests/test_config.json"
 
@@ -68,3 +76,26 @@ def test_master_bot_dispatch():
     # /mode
     bot.dispatch_message({"chat": {"id": 12345}, "text": "/mode manual"})
     assert cfg.mode == "manual"
+
+def test_full_button_keyboards():
+    mock_catalog = [
+        {"id": "1", "title": "Anime One", "status": "Finished"},
+        {"id": "2", "title": "Anime Two", "status": "Ongoing"}
+    ]
+    with patch("src.master_bot.get_latest_catalog", return_value=mock_catalog):
+        text, kb = build_catalog_keyboard(page=0)
+        assert "Anime One" in kb["inline_keyboard"][0][0]["text"]
+        assert kb["inline_keyboard"][0][0]["callback_data"] == "anime_1"
+
+    mock_detail = {"id": "1", "title": "Anime One", "status": "Finished", "year": "2026", "genre": "Action"}
+    mock_episodes = [{"id": "ep1", "index": 1, "title": "Ep 1"}]
+    with patch("src.master_bot.get_movie_details", return_value=mock_detail), \
+         patch("src.master_bot.get_movie_episodes", return_value=mock_episodes):
+        text, kb = build_anime_detail_keyboard("1", db_path="tests/test_tmp.sqlite")
+        assert "Anime One" in text
+        assert kb["inline_keyboard"][0][0]["callback_data"] == "dlall_1"
+        assert kb["inline_keyboard"][1][0]["callback_data"] == "epmenu_1"
+
+        text_ep, kb_ep = build_episodes_keyboard("1", db_path="tests/test_tmp.sqlite")
+        assert "Ep 1" in kb_ep["inline_keyboard"][0][0]["text"]
+        assert kb_ep["inline_keyboard"][0][0]["callback_data"] == "dlep_1_ep1_1"
