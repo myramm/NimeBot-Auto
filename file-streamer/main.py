@@ -186,6 +186,7 @@ def get_movie_episodes(movie_id: str) -> List[Dict[str, Any]]:
             item = dict(ep)
             item["index"] = idx
             formatted.append(item)
+        formatted.sort(key=lambda x: x["index"])
         return formatted
     except Exception as e:
         logging.error(f"Error episodes {movie_id}: {e}")
@@ -379,6 +380,7 @@ async def run_transfer_pipeline(client: TelegramClient, chat_id: int, prog_msg_i
     global IS_RUNNING
     IS_RUNNING = True
     logging.info(f"Transfer pipeline started. Total items in queue: {len(items)}")
+    posted_anime_headers = set()
 
     try:
         for idx, item in enumerate(items, 1):
@@ -396,6 +398,55 @@ async def run_transfer_pipeline(client: TelegramClient, chat_id: int, prog_msg_i
             if has_uploaded(m_id, ep_idx, q):
                 logging.info(f"Skipping already uploaded: {title} Ep {ep_idx} ({q})")
                 continue
+
+            # Post Anime Info Card with Poster before first episode in this batch
+            if m_id not in posted_anime_headers:
+                try:
+                    det = get_movie_details(m_id)
+                    if det:
+                        poster_url = det.get("image_poster") or det.get("image_cover")
+                        a_title = det.get("title", title)
+                        status = det.get("status", "-")
+                        year = det.get("year", "-")
+                        genre = det.get("genre", "-")
+                        synopsis = det.get("synopsis", "")
+                        a_type = det.get("type", "Anime")
+
+                        info_caption = (
+                            f"🎬 **{a_title}**\n"
+                            "━━━━━━━━━━━━━━━━━━\n"
+                            f"📌 **Status:** `{status}` | **Tipe:** `{a_type}`\n"
+                            f"🏷 **Genre:** `{genre}`\n"
+                            f"📅 **Tahun:** `{year}`\n"
+                            "━━━━━━━━━━━━━━━━━━\n"
+                            f"📖 **Sinopsis:**\n_{synopsis}_\n"
+                            "━━━━━━━━━━━━━━━━━━\n"
+                            "🍿 Disiarkan otomatis via NimeBot Auto"
+                        )
+
+                        poster_path = None
+                        if poster_url:
+                            try:
+                                p_file = f"/tmp/poster_{m_id}.jpg"
+                                ua = get_scraper_config("user_agent", "okhttp/4.12.0")
+                                base = get_scraper_config("base_url", "https://xyz-api.animein.net")
+                                req = urllib.request.Request(poster_url, headers={"User-Agent": ua, "Referer": base})
+                                with urllib.request.urlopen(req, timeout=15) as resp, open(p_file, "wb") as pf:
+                                    pf.write(resp.read())
+                                poster_path = p_file
+                            except Exception as err:
+                                logging.warning(f"Could not download poster: {err}")
+
+                        if poster_path and os.path.exists(poster_path):
+                            await client.send_file(LOG_CHANNEL, poster_path, caption=info_caption)
+                            try: os.remove(poster_path)
+                            except Exception: pass
+                        else:
+                            await client.send_message(LOG_CHANNEL, info_caption)
+
+                        posted_anime_headers.add(m_id)
+                except Exception as e:
+                    logging.error(f"Error posting anime info card: {e}")
 
             filename = f"/tmp/{m_id}_{ep_idx}_{q}.mp4"
             logging.info(f"[{idx}/{len(items)}] Downloading: {title} Ep {ep_idx} ({q}) from {s_url}")
@@ -442,7 +493,11 @@ async def run_transfer_pipeline(client: TelegramClient, chat_id: int, prog_msg_i
                 el = max(0.001, time.time() - t_up)
                 await notify_progress(client, chat_id, prog_msg_id, title, ep_idx, q, "Uploading to Telegram", sent, total, sent / el)
 
-            caption = f"🎬 **{title} - Episode {ep_idx} ({q})**\n\n🍿 Disiarkan otomatis via NimeBot Auto"
+            caption = (
+                f"🎬 **{title}**\n"
+                f"📌 **Episode {ep_idx}** ({q})\n\n"
+                f"🍿 Disiarkan otomatis via NimeBot Auto"
+            )
             sent_msg = await client.send_file(
                 LOG_CHANNEL,
                 filename,
@@ -732,8 +787,8 @@ async def main():
                     pass
 
                 eps = await asyncio.to_thread(get_movie_episodes, m_id)
-                # Check top 3 newest released episodes per anime
-                for ep in eps[:3]:
+                # Check all episodes in ascending order (Ep 1 to Ep N)
+                for ep in eps:
                     ep_id = str(ep.get("id"))
                     ep_idx = int(ep.get("index", 0))
                     # Pre-check if standard qualities are already uploaded

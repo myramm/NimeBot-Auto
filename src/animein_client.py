@@ -88,6 +88,7 @@ def get_movie_episodes(movie_id: Union[int, str]) -> List[Dict[str, Any]]:
                     item = dict(ep)
                     item["index"] = idx_val
                     formatted.append(item)
+                formatted.sort(key=lambda x: x["index"])
                 return formatted
         return []
     except Exception as e:
