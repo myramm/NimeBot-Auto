@@ -1,0 +1,9 @@
+.*
+!.gitignore
+!.superpowers
+__pycache__/
+*.pyc
+*.sqlite
+monitor.log
+yami_watch.log
+logo-design-skill/
