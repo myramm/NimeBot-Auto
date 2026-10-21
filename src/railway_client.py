@@ -1,14 +1,15 @@
 import json
 import urllib.request
 import urllib.error
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 
 RAILWAY_GRAPHQL_URL = "https://backboard.railway.com/graphql/v2"
 
 def execute_graphql(token: str, query: str, variables: Optional[Dict[str, Any]] = None, timeout: int = 15) -> Dict[str, Any]:
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {token.strip()}"
+        "Authorization": f"Bearer {token.strip()}",
+        "User-Agent": "railway-cli/5.71.0"
     }
     payload = {"query": query}
     if variables:
@@ -44,29 +45,56 @@ def verify_railway_token(token: str) -> Optional[Dict[str, Any]]:
         return res["data"]["me"]
     return None
 
-def list_projects(token: str) -> list:
+def get_project_details(token: str, project_id: str) -> Optional[Dict[str, Any]]:
+    query = f"""
+    query {{
+        project(id: "{project_id}") {{
+            id
+            name
+            environments {{
+                edges {{
+                    node {{
+                        id
+                        name
+                    }}
+                }}
+            }}
+            services {{
+                edges {{
+                    node {{
+                        id
+                        name
+                    }}
+                }}
+            }}
+        }}
+    }}
+    """
+    res = execute_graphql(token, query)
+    try:
+        return res["data"]["project"]
+    except Exception:
+        return None
+
+def list_projects(token: str) -> List[Dict[str, Any]]:
     query = """
     query {
-        projects {
-            edges {
-                node {
-                    id
-                    name
-                    environments {
-                        edges {
-                            node {
-                                id
-                                name
-                            }
+        me {
+            workspaces {
+                projects {
+                    edges {
+                        node {
+                            id
+                            name
                         }
                     }
-                    services {
-                        edges {
-                            node {
-                                id
-                                name
-                            }
-                        }
+                }
+            }
+            projects {
+                edges {
+                    node {
+                        id
+                        name
                     }
                 }
             }
@@ -74,11 +102,41 @@ def list_projects(token: str) -> list:
     }
     """
     res = execute_graphql(token, query)
+    proj_ids = []
+    
     try:
-        edges = res["data"]["projects"]["edges"]
-        return [e["node"] for e in edges]
+        # Check workspaces
+        workspaces = res.get("data", {}).get("me", {}).get("workspaces", [])
+        for ws in workspaces:
+            for edge in ws.get("projects", {}).get("edges", []):
+                p_id = edge.get("node", {}).get("id")
+                if p_id and p_id not in proj_ids:
+                    proj_ids.append(p_id)
+        
+        # Check personal projects
+        for edge in res.get("data", {}).get("me", {}).get("projects", {}).get("edges", []):
+            p_id = edge.get("node", {}).get("id")
+            if p_id and p_id not in proj_ids:
+                proj_ids.append(p_id)
     except Exception:
-        return []
+        pass
+
+    # Check top-level projects if returned (e.g. from service token or mock)
+    top_edges = res.get("data", {}).get("projects", {}).get("edges", [])
+    if top_edges:
+        top_projects = [e["node"] for e in top_edges if "node" in e]
+        if top_projects and "services" in top_projects[0]:
+            return top_projects
+        for e in top_edges:
+            pid = e.get("node", {}).get("id")
+            if pid and pid not in proj_ids:
+                proj_ids.append(pid)
+    results = []
+    for pid in proj_ids:
+        details = get_project_details(token, pid)
+        if details:
+            results.append(details)
+    return results
 
 def ensure_railway_project(token: str, project_name: str = "file-streamer") -> Tuple[str, str, str]:
     """
@@ -97,19 +155,18 @@ def ensure_railway_project(token: str, project_name: str = "file-streamer") -> T
         
     if not target_project:
         # Create new project if none found
-        create_query = """
-        mutation projectCreate($input: ProjectCreateInput!) {
-            projectCreate(input: $input) {
+        create_query = f"""
+        mutation {{
+            projectCreate(input: {{ name: "{project_name}" }}) {{
                 id
                 name
-            }
-        }
+            }}
+        }}
         """
-        res = execute_graphql(token, create_query, {"input": {"name": project_name}})
-        p_id = res["data"]["projectCreate"]["id"]
-        # re-query project to get default environment
-        projects = list_projects(token)
-        target_project = next((p for p in projects if p["id"] == p_id), None)
+        res = execute_graphql(token, create_query)
+        p_id = res.get("data", {}).get("projectCreate", {}).get("id")
+        if p_id:
+            target_project = get_project_details(token, p_id)
         if not target_project:
             raise RuntimeError(f"Failed to provision Railway project {project_name}")
 
@@ -163,22 +220,22 @@ def stop_worker(token: str, deployment_id: str) -> bool:
     return bool(res.get("data", {}).get("deploymentRemove"))
 
 def get_latest_deployment(token: str, service_id: str, env_id: str) -> Optional[Dict[str, Any]]:
-    query = """
-    query service($id: String!) {
-        service(id: $id) {
-            deployments(first: 1) {
-                edges {
-                    node {
+    query = f"""
+    query {{
+        service(id: "{service_id}") {{
+            deployments(first: 1) {{
+                edges {{
+                    node {{
                         id
                         status
                         createdAt
-                    }
-                }
-            }
-        }
-    }
+                    }}
+                }}
+            }}
+        }}
+    }}
     """
-    res = execute_graphql(token, query, {"id": service_id})
+    res = execute_graphql(token, query)
     try:
         edges = res["data"]["service"]["deployments"]["edges"]
         if edges:

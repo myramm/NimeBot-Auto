@@ -1,0 +1,17 @@
+{
+  "bot_token": "YOUR_BOT_TOKEN_HERE",
+  "api_id": "37124183",
+  "api_hash": "f4d846728e694c2d1071ca7d3b2f6c81",
+  "log_channel": "-1004462080662",
+  "streamer_url": "https://streamer-production-c24a.up.railway.app",
+  "railway_token": "",
+  "railway_email": "",
+  "railway_project_id": "9cb30572-6794-4cf6-9df2-778e6933d48d",
+  "railway_env_id": "035a4bdc-a53c-431a-b077-992b0224ea67",
+  "railway_service_id": "4b50b07a-8ee6-4ce7-b7fa-90e29428c6d8",
+  "mode": "auto",
+  "is_running": false,
+  "active_deployment_id": "",
+  "active_progress_msg_id": 0,
+  "admin_chat_id": 0
+}

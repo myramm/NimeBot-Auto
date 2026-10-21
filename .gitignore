@@ -4,6 +4,8 @@
 __pycache__/
 *.pyc
 *.sqlite
-monitor.log
-yami_watch.log
+*.log
+config.json
+monitor_and_stop.py
+watch_yami_stop.py
 logo-design-skill/
