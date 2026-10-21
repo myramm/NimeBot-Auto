@@ -37,7 +37,7 @@ LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL", "0") or "0")
 STREAMER_URL = os.environ.get("STREAMER_URL", "https://uploader-production-26af.up.railway.app").rstrip("/")
 DB_PATH = os.environ.get("DB_PATH", "/app/anime_db.sqlite" if os.path.exists("/app") else "anime_db.sqlite")
 
-ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID", "6164710787").strip()  # Owner / Admin ID(s)
+ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID", "6164710787,8942930830").strip()  # Owner / Admin ID(s)
 CURRENT_MODE = "auto"
 CURRENT_EMAIL = "bexdofjohn@gmail.com"
 IS_RUNNING = False
