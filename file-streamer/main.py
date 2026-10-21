@@ -20,6 +20,7 @@ socket.getaddrinfo = _getaddrinfo_ipv4
 
 from telethon import TelegramClient, events, Button
 from telethon.tl.types import DocumentAttributeVideo
+from aiohttp import web
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,7 +33,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 API_ID = int(os.environ.get("API_ID", "0") or "0")
 API_HASH = os.environ.get("API_HASH", "")
 LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL", "0") or "0")
-STREAMER_URL = os.environ.get("STREAMER_URL", "https://streamer-production-c24a.up.railway.app").rstrip("/")
+STREAMER_URL = os.environ.get("STREAMER_URL", "https://uploader-production-26af.up.railway.app").rstrip("/")
 DB_PATH = os.environ.get("DB_PATH", "/app/anime_db.sqlite" if os.path.exists("/app") else "anime_db.sqlite")
 
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "6164710787"))  # Owner / Admin
@@ -100,6 +101,38 @@ def record_upload(movie_id: str, ep_index: int, quality: str, msg_id: int, title
     conn.commit()
     conn.close()
 
+def get_record_by_msg_id(msg_id: int) -> Optional[Dict[str, Any]]:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT movie_id, ep_index, quality, msg_id, anime_title, created_at FROM records WHERE msg_id = ?", (msg_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {
+            "movie_id": row[0],
+            "ep_index": row[1],
+            "quality": row[2],
+            "msg_id": row[3],
+            "anime_title": row[4],
+            "created_at": row[5]
+        }
+    return None
+
+def get_recent_uploads(limit: int = 40) -> List[Dict[str, Any]]:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT movie_id, ep_index, quality, msg_id, anime_title, created_at FROM records ORDER BY created_at DESC LIMIT ?", (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [{
+        "movie_id": r[0],
+        "ep_index": r[1],
+        "quality": r[2],
+        "msg_id": r[3],
+        "anime_title": r[4],
+        "created_at": r[5]
+    } for r in rows]
+
 # ----------------- CONFIGURABLE SCRAPER SETTINGS -----------------
 def get_scraper_config(key: str, default: str) -> str:
     try:
@@ -121,7 +154,7 @@ def set_scraper_config(key: str, value: str):
     conn.commit()
     conn.close()
     global _catalog_cache
-    _catalog_cache = (0.0, [])  # invalidate cache when scraper config changes
+    _catalog_cache = (0.0, [])
 
 def reset_scraper_config():
     conn = sqlite3.connect(DB_PATH)
@@ -139,7 +172,6 @@ def api_get(endpoint: str, timeout: int = 15) -> Dict[str, Any]:
     ua = get_scraper_config("user_agent", "okhttp/4.12.0")
     apk_ver = get_scraper_config("apk_ver", "5.2.2")
 
-    # Interpolate or update apk_ver if dynamic
     if "apk_ver=" in endpoint:
         endpoint = re.sub(r"apk_ver=[^&]+", f"apk_ver={apk_ver}", endpoint)
     else:
@@ -530,13 +562,271 @@ async def run_transfer_pipeline(client: TelegramClient, chat_id: int, prog_msg_i
     finally:
         IS_RUNNING = False
 
-# ----------------- MAIN TELEGRAM APP -----------------
+# ----------------- EMBEDDED AIOHTTP WEB STREAMER -----------------
+def create_web_app(tg_client: TelegramClient) -> web.Application:
+    app = web.Application()
+
+    async def handle_index(request: web.Request) -> web.Response:
+        records = get_recent_uploads(50)
+        cards_html = ""
+        for r in records:
+            msg_id = r["msg_id"]
+            title = r["anime_title"]
+            ep = r["ep_index"]
+            q = r["quality"]
+            cards_html += f"""
+            <div class="card">
+                <div class="card-title">🎬 {title}</div>
+                <div class="card-meta">Episode {ep} • <span class="badge">{q}</span></div>
+                <div class="card-actions">
+                    <a href="/watch/{msg_id}" class="btn">▶️ Nonton</a>
+                    <a href="/download/{msg_id}" class="btn btn-sec">📥 Download</a>
+                </div>
+            </div>
+            """
+        if not cards_html:
+            cards_html = "<p style='color: #94a3b8; text-align: center;'>Belum ada episode anime yang diunggah.</p>"
+
+        html = f"""<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NimeBot Auto - Web Streamer Portal</title>
+    <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{
+            background: #0f172a; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            padding: 30px 16px; min-height: 100vh;
+        }}
+        .header {{ text-align: center; margin-bottom: 30px; }}
+        .header h1 {{ font-size: 26px; margin-bottom: 8px; color: #38bdf8; }}
+        .header p {{ color: #94a3b8; font-size: 15px; }}
+        .grid {{
+            display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 16px; max-width: 1100px; margin: 0 auto;
+        }}
+        .card {{
+            background: #1e293b; border-radius: 12px; padding: 18px; border: 1px solid #334155;
+            display: flex; flex-direction: column; justify-content: space-between;
+        }}
+        .card-title {{ font-size: 16px; font-weight: 700; color: #f1f5f9; margin-bottom: 8px; }}
+        .card-meta {{ color: #94a3b8; font-size: 13px; margin-bottom: 16px; }}
+        .badge {{ background: #3b82f6; color: white; padding: 2px 6px; border-radius: 4px; font-size: 11px; }}
+        .card-actions {{ display: flex; gap: 8px; }}
+        .btn {{
+            flex: 1; text-align: center; background: #2563eb; color: white; text-decoration: none;
+            padding: 8px 12px; border-radius: 6px; font-size: 13px; font-weight: 600;
+        }}
+        .btn-sec {{ background: #334155; }}
+        .btn:hover {{ opacity: 0.9; }}
+        footer {{ text-align: center; margin-top: 40px; color: #64748b; font-size: 13px; }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🤖 NimeBot Auto - Web Streamer</h1>
+        <p>Streaming & Direct Download Anime Cepat Berbasis Cloud Telegram & Railway</p>
+    </div>
+    <div class="grid">
+        {cards_html}
+    </div>
+    <footer>
+        &copy; 2026 NimeBot Auto Cloud • Running on Railway
+    </footer>
+</body>
+</html>"""
+        return web.Response(text=html, content_type="text/html")
+
+    async def handle_watch(request: web.Request) -> web.Response:
+        try:
+            msg_id = int(request.match_info["msg_id"])
+        except ValueError:
+            return web.Response(text="ID Pesan tidak valid", status=400)
+
+        record = get_record_by_msg_id(msg_id)
+        title = record["anime_title"] if record else f"Anime #{msg_id}"
+        ep_idx = record["ep_index"] if record else 1
+        quality = record["quality"] if record else "720p"
+
+        # Try to get Telegram file size
+        file_size_str = "Video MP4"
+        try:
+            msg = await tg_client.get_messages(LOG_CHANNEL, ids=msg_id)
+            if msg and msg.media and hasattr(msg.media, "document"):
+                file_size_str = human_bytes(msg.media.document.size)
+        except Exception:
+            pass
+
+        tg_chat_link = f"https://t.me/c/{abs(LOG_CHANNEL) - 1000000000000}/{msg_id}" if LOG_CHANNEL != 0 else "#"
+
+        html = f"""<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{title} - Episode {ep_idx} ({quality}) | NimeBot Auto</title>
+    <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{
+            background: #0f172a; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            display: flex; flex-direction: column; align-items: center; min-height: 100vh; padding: 20px 10px;
+        }}
+        .container {{
+            width: 100%; max-width: 900px; background: #1e293b; border-radius: 12px;
+            overflow: hidden; box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+        }}
+        .player-wrapper {{
+            position: relative; background: #000; width: 100%; aspect-ratio: 16 / 9;
+        }}
+        video {{ width: 100%; height: 100%; display: block; }}
+        .info {{ padding: 20px; }}
+        .badge {{
+            display: inline-block; background: #3b82f6; color: white; font-size: 12px;
+            font-weight: 700; padding: 4px 8px; border-radius: 6px; margin-bottom: 8px;
+        }}
+        h1 {{ font-size: 20px; font-weight: 700; margin-bottom: 12px; color: #fff; }}
+        .meta {{ color: #94a3b8; font-size: 14px; margin-bottom: 20px; }}
+        .actions {{ display: flex; gap: 10px; flex-wrap: wrap; }}
+        .btn {{
+            display: inline-flex; align-items: center; gap: 6px; background: #2563eb; color: white;
+            text-decoration: none; padding: 10px 18px; border-radius: 8px; font-size: 14px; font-weight: 600;
+        }}
+        .btn-sec {{ background: #334155; }}
+        .btn:hover {{ opacity: 0.9; }}
+        footer {{ margin-top: 30px; color: #64748b; font-size: 13px; text-align: center; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="player-wrapper">
+            <video controls autoplay playsinline preload="metadata">
+                <source src="/stream/{msg_id}" type="video/mp4">
+                Browser Anda tidak mendukung pemutar video HTML5.
+            </video>
+        </div>
+        <div class="info">
+            <span class="badge">{quality}</span>
+            <h1>🎬 {title} - Episode {ep_idx}</h1>
+            <p class="meta">Ukuran file: <strong>{file_size_str}</strong> • Disiarkan otomatis via NimeBot Auto</p>
+            <div class="actions">
+                <a href="/download/{msg_id}" class="btn">📥 Direct Download ({file_size_str})</a>
+                <a href="{tg_chat_link}" class="btn btn-sec">💬 Buka di Telegram</a>
+                <a href="/" class="btn btn-sec">🏠 Beranda Portal</a>
+            </div>
+        </div>
+    </div>
+    <footer>
+        &copy; 2026 NimeBot Auto Cloud • Running on Railway
+    </footer>
+</body>
+</html>"""
+        return web.Response(text=html, content_type="text/html")
+
+    async def handle_stream(request: web.Request) -> web.StreamResponse:
+        return await stream_telegram_file(request, tg_client, is_download=False)
+
+    async def handle_download(request: web.Request) -> web.StreamResponse:
+        return await stream_telegram_file(request, tg_client, is_download=True)
+
+    app.router.add_get("/", handle_index)
+    app.router.add_get("/watch/{msg_id}", handle_watch)
+    app.router.add_get("/stream/{msg_id}", handle_stream)
+    app.router.add_get("/download/{msg_id}", handle_download)
+    return app
+
+async def stream_telegram_file(request: web.Request, tg_client: TelegramClient, is_download: bool = False) -> web.StreamResponse:
+    try:
+        msg_id = int(request.match_info["msg_id"])
+    except ValueError:
+        return web.Response(text="ID Pesan tidak valid", status=400)
+
+    try:
+        msg = await tg_client.get_messages(LOG_CHANNEL, ids=msg_id)
+    except Exception as e:
+        logging.error(f"Error fetching message {msg_id}: {e}")
+        return web.Response(text=f"Error Telegram: {e}", status=502)
+
+    if not msg or not msg.media or not hasattr(msg.media, "document"):
+        return web.Response(text="Video tidak ditemukan di Telegram Storage", status=404)
+
+    doc = msg.media.document
+    file_size = doc.size
+    mime_type = doc.mime_type or "video/mp4"
+
+    record = get_record_by_msg_id(msg_id)
+    if record:
+        fname = f"{record['anime_title']} - Ep {record['ep_index']} ({record['quality']}).mp4"
+    else:
+        fname = f"Anime_Episode_{msg_id}.mp4"
+
+    disposition = "attachment" if is_download else "inline"
+    range_header = request.headers.get("Range")
+
+    if range_header:
+        # HTTP 206 Partial Content (Supports Video Seeking/Scrubbing)
+        match = re.match(r"bytes=(\d+)-(\d*)", range_header)
+        if match:
+            start = int(match.group(1))
+            end = int(match.group(2)) if match.group(2) else file_size - 1
+        else:
+            start = 0
+            end = file_size - 1
+
+        start = max(0, min(start, file_size - 1))
+        end = max(start, min(end, file_size - 1))
+        content_length = end - start + 1
+
+        headers = {
+            "Content-Type": mime_type,
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(content_length),
+            "Content-Disposition": f'{disposition}; filename="{fname}"'
+        }
+        response = web.StreamResponse(status=206, reason="Partial Content", headers=headers)
+        await response.prepare(request)
+
+        try:
+            async for chunk in tg_client.iter_download(doc, offset=start, limit=content_length, chunk_size=256 * 1024):
+                await response.write(chunk)
+        except (ConnectionResetError, asyncio.CancelledError):
+            pass
+        return response
+    else:
+        # Standard Full File Stream / Download
+        headers = {
+            "Content-Type": mime_type,
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(file_size),
+            "Content-Disposition": f'{disposition}; filename="{fname}"'
+        }
+        response = web.StreamResponse(status=200, headers=headers)
+        await response.prepare(request)
+
+        try:
+            async for chunk in tg_client.iter_download(doc, chunk_size=256 * 1024):
+                await response.write(chunk)
+        except (ConnectionResetError, asyncio.CancelledError):
+            pass
+        return response
+
+# ----------------- MAIN TELEGRAM APP & WEB RUNNER -----------------
 async def main():
     init_db()
     logging.info("Starting NimeBot Auto on Railway container...")
     client = TelegramClient("railway_session", API_ID, API_HASH)
     await client.start(bot_token=BOT_TOKEN)
     logging.info("Telegram Bot Client connected and authorized successfully!")
+
+    # Setup & Launch Integrated aiohttp Web Streamer
+    app = create_web_app(client)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", "8080"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"NimeBot Auto Web Streamer listening on http://0.0.0.0:{port}!")
 
     @client.on(events.NewMessage)
     async def on_message(event):
@@ -548,7 +838,6 @@ async def main():
         text = event.raw_text.strip()
         state = USER_STATES.get(user_id)
 
-        # Allow admin or anyone in private chat to start if admin ID matches
         if ADMIN_USER_ID and user_id != ADMIN_USER_ID:
             await event.respond("⛔ **Akses Terbatas:** Anda bukan pemilik bot ini.")
             return
@@ -660,7 +949,10 @@ async def main():
             await event.answer("⛔ Akses ditolak", alert=True)
             return
 
-        await event.answer("Memproses...")
+        try:
+            await event.answer("Memproses...")
+        except Exception:
+            pass
 
         if data == "btn_menu":
             t, b = build_menu(CURRENT_MODE, IS_RUNNING)
